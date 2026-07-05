@@ -9,11 +9,12 @@ import io
 import contextlib
 import os
 from dotenv import load_dotenv
-load_dotenv()
 
 
 # 当前项目目录
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+load_dotenv(os.path.join(BASE_DIR, ".env"))
+
 
 # 字体文件
 FONT_PATH = os.path.join(BASE_DIR, "fonts", "NotoSansCJK-Regular.ttc")
@@ -69,6 +70,7 @@ if uploaded_file is not None:
 
     if st.button("开始分析"):
 
+        safe_question = question.replace("{", "{{").replace("}", "}}")
         prompt = f"""
 你是一名Python数据分析专家。
 
@@ -84,7 +86,7 @@ df字段如下：
 
 用户的问题：
 
-{question}
+{safe_question}
 
 
 你是一名专业的 Python 数据分析专家。
@@ -163,6 +165,14 @@ result = avg_score
             )
 
             code = response.choices[0].message.content
+
+            # 清洗可能的markdown代码块标记
+            code = code.strip()
+            if code.startswith("```"):
+                code = code.split("\n", 1)[1] if "\n" in code else code[3:]
+            if code.endswith("```"):
+                code = code.rsplit("\n", 1)[0] if "\n" in code else ""
+            code = code.strip()
 
             output = io.StringIO()
 
