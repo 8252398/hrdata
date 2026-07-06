@@ -23,83 +23,13 @@ else:
 matplotlib.rcParams["axes.unicode_minus"] = False
 
 st.set_page_config(page_title="HR培训数据分析", layout="wide")
+
+# 初始化分析结果缓存
+for key in ["report_df", "total_hours", "recent_40_90", "recent_90_plus", "df_person", "df_hours"]:
+    if key not in st.session_state:
+        st.session_state[key] = None
+
 st.title("📊 HR培训数据分析")
-
-with st.sidebar:
-    st.header("🔑 DeepSeek API Key")
-    with st.form("ds_form", clear_on_submit=False):
-        ds_key = st.text_input("API Key", type="password", placeholder="sk-...")
-        if st.form_submit_button("确认"):
-            if ds_key:
-                st.session_state.ds_key = ds_key
-                st.success("已保存")
-            else:
-                st.warning("请输入 Key")
-    st.divider()
-
-    # 初始化 DeepSeek 客户端
-    if "ds_key" in st.session_state and st.session_state.ds_key:
-        client = OpenAI(
-            api_key=st.session_state.ds_key,
-            base_url="https://api.deepseek.com"
-        )
-
-        st.header("💬 AI 自由分析")
-        ai_question = st.text_area("输入问题", placeholder="例：统计各部门人数", key="ai_q")
-        if st.button("AI 分析", key="ai_btn"):
-            if ai_question and "df_person" in dir() and "df_hours" in dir():
-                safe_q = ai_question.replace("{", "{{").replace("}", "}}")
-                df_info = f"""[人员基础信息] 字段: {list(df_person.columns)}
-前3行: {df_person.head(3).to_markdown()}
-
-[培训学时记录] 字段: {list(df_hours.columns)}
-前3行: {df_hours.head(3).to_markdown()}"""
-
-                ai_prompt = f"""你是HR数据分析专家，根据以下数据回答用户问题，只返回Python代码。
-DataFrame变量名: df_person（人员基础信息）, df_hours（培训学时记录）
-{df_info}
-用户问题: {safe_q}
-
-规则: 只返回Python代码，不输出解释和```标记，结果存到result变量，
-如需绘图用matplotlib（fontproperties=CN_FONT），不调plt.show()
-如果有文字分析存到report变量。"""
-
-                with st.spinner("AI分析中..."):
-                    resp = client.chat.completions.create(
-                        model="deepseek-v4-pro",
-                        messages=[{"role":"user","content":ai_prompt}]
-                    )
-                    code = resp.choices[0].message.content
-                    code = code.strip()
-                    if code.startswith("```"):
-                        code = code.split("\n",1)[1] if "\n" in code else code[3:]
-                    if code.endswith("```"):
-                        code = code.rsplit("\n",1)[0]
-                    code = code.strip()
-
-                    out = io.StringIO()
-                    lvars = {"df_person":df_person,"df_hours":df_hours,"pd":pd,"plt":plt,"CN_FONT":CN_FONT}
-                    try:
-                        with contextlib.redirect_stdout(out):
-                            exec(code,{},lvars)
-                        if "result" in lvars:
-                            r = lvars["result"]
-                            if isinstance(r,pd.DataFrame):
-                                st.dataframe(r)
-                            else:
-                                st.write(r)
-                        if "report" in lvars:
-                            st.markdown(lvars["report"])
-                        fig = plt.gcf()
-                        if len(fig.axes)>0:
-                            st.pyplot(fig)
-                            plt.clf()
-                    except Exception as e:
-                        st.error(f"执行出错: {e}")
-            else:
-                st.info("请先上传数据")
-
-
 
 # ============ 固定规则 ============
 KEY_FIELD = "集团员工编码"
@@ -108,7 +38,7 @@ METHOD_FIELD = "培训方式"
 HOURS_FIELD = "学时"
 DATE_FIELD = "完成学习时间"
 
-# ============ 侧边栏 ============
+
 with st.sidebar:
     st.header("⚙️ 字段映射")
     st.caption("默认已按实际表头配置，无需修改")
@@ -136,6 +66,9 @@ if file1 and file2:
         target = sheet_name if sheet_name and sheet_name in sheets else max(sheets, key=lambda s: pd.read_excel(file2, sheet_name=s).shape[0])
         df_hours = pd.read_excel(file2, sheet_name=target)
         sheet_name = target
+
+    st.session_state.df_person = df_person
+    st.session_state.df_hours = df_hours
 
     # --- 校验关键列 ---
     missing = []
@@ -253,7 +186,7 @@ if file1 and file2:
 
             # 模块一：累计学时
             th = total_hours[total_hours[col_id] == pid]
-            row["累计培训学时"] = f"{th.iloc[0]['累计培训学时']:.1f}" if len(th) > 0 else "0.0"
+            row["累计培训学时"] = th.iloc[0]["累计培训学时"] if len(th) > 0 else 0.0
 
             # 模块二：40≤学时<90 最近一次
             if not recent_40_90.empty and pid in recent_40_90[col_id].values:
@@ -280,6 +213,13 @@ if file1 and file2:
             rows.append(row)
 
         report_df = pd.DataFrame(rows)
+        # 数值列转为数字类型，便于AI分析
+        if "累计培训学时" in report_df.columns:
+            report_df["累计培训学时"] = pd.to_numeric(report_df["累计培训学时"], errors="coerce")
+        st.session_state.report_df = report_df
+        st.session_state.total_hours = total_hours
+        st.session_state.recent_40_90 = recent_40_90
+        st.session_state.recent_90_plus = recent_90_plus
 
         # ===== 规则7: Markdown表格输出 =====
         st.info("**规则7**：表头标注字段来源（表1/表2）")
@@ -298,3 +238,95 @@ if file1 and file2:
                     recent_90_plus.to_excel(writer, sheet_name="90+学时详情", index=False)
             st.download_button("下载 Excel", output.getvalue(), "HR培训分析结果.xlsx",
                                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+# ============ AI 深度分析（基于分析结果）============
+if st.session_state.report_df is not None:
+    st.divider()
+    st.subheader("🤖 AI 深度分析")
+
+    report_df = st.session_state.report_df
+    total_hours = st.session_state.total_hours
+    recent_40_90 = st.session_state.recent_40_90
+    recent_90_plus = st.session_state.recent_90_plus
+    df_person = st.session_state.df_person
+    df_hours = st.session_state.df_hours
+    with st.expander("⚙️ 配置 DeepSeek API Key", expanded=False):
+        ds_key = st.text_input("API Key", type="password", placeholder="sk-...", key="ds_key_post")
+    ds_key = st.session_state.get("ds_key_post", "")
+    if ds_key:
+        client = OpenAI(
+            api_key=st.session_state.ds_key_post,
+            base_url="https://api.deepseek.com"
+        )
+        ai_question = st.text_area("对分析结果提问", placeholder="例：哪些部门的人均学时最高？40~90区间人数最多的培训是什么？", key="ai_q_post")
+        if st.button("AI 分析", key="ai_btn_post"):
+            if ai_question:
+                safe_q = ai_question.replace("{", "{{").replace("}", "}}")
+                # 构建报表摘要
+                report_summary = f"""分析报表(report_df)共{len(report_df)}人，
+字段:
+- 员工编码（表1）、姓名（表1）、干部标识（表1）
+- 累计培训学时
+- 40~90区间: 班次名称、开始学习时间、完成学习时间、培训机构、主办单位（表2）
+- 90+区间: 班次名称、开始学习时间、完成学习时间、培训机构、主办单位（表2）
+
+累计培训总学时: {total_hours["累计培训学时"].sum():.0f}
+40~90区间有记录人数: {len(recent_40_90)}
+90+区间有记录人数: {len(recent_90_plus)}
+
+报表前20行:
+{report_df.head(20).to_markdown()}"""
+
+                ai_prompt = f"""你是HR数据分析专家。用户上传了两张表（人员基础信息、培训学时记录），
+经过固定流程处理后生成了分析报表report_df。请根据report_df回答用户问题。
+
+{report_summary}
+
+用户问题: {safe_q}
+
+请直接对report_df进行操作（筛选、统计、排序、分组等），
+如需要也可使用total_hours、recent_40_90、recent_90_plus辅助。
+只返回Python代码，不输出解释和```标记。
+结果存到result变量，如需文字总结存到report变量（Markdown格式）。
+如需绘图用matplotlib（fontproperties=CN_FONT，不调plt.show()）。"""
+                with st.spinner("AI分析中..."):
+                    resp = client.chat.completions.create(
+                        model="deepseek-v4-pro",
+                        messages=[{"role":"user","content":ai_prompt}]
+                    )
+                    code = resp.choices[0].message.content
+                    code = code.strip()
+                    if code.startswith("```"):
+                        code = code.split("\n",1)[1] if "\n" in code else code[3:]
+                    if code.endswith("```"):
+                        code = code.rsplit("\n",1)[0]
+                    code = code.strip()
+                    lvars = {
+                        "df_person":df_person,
+                        "df_hours":df_hours,
+                        "total_hours":total_hours,
+                        "recent_40_90":recent_40_90,
+                        "recent_90_plus":recent_90_plus,
+                        "report_df":report_df,
+                        "pd":pd,"plt":plt,"CN_FONT":CN_FONT
+                    }
+                    try:
+                        out = io.StringIO()
+                        with contextlib.redirect_stdout(out):
+                            exec(code,{},lvars)
+                        if "result" in lvars:
+                            r = lvars["result"]
+                            if isinstance(r,pd.DataFrame):
+                                st.dataframe(r)
+                            else:
+                                st.write(r)
+                        if "report" in lvars:
+                            st.markdown(lvars["report"])
+                        fig = plt.gcf()
+                        if len(fig.axes)>0:
+                            st.pyplot(fig)
+                            plt.clf()
+                    except Exception as e:
+                        with st.expander("查看生成的代码"):
+                            st.code(code, language="python")
+                        st.error(f"执行出错: {e}")
