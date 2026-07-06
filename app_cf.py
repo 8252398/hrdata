@@ -4,6 +4,8 @@ import matplotlib.pyplot as plt
 from matplotlib.font_manager import FontProperties
 from matplotlib import font_manager
 import matplotlib
+matplotlib.use('Agg')  # 无头Linux环境必需
+
 from openai import OpenAI
 import io
 import contextlib
@@ -16,16 +18,12 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # 字体文件
 FONT_PATH = os.path.join(BASE_DIR, "fonts", "NotoSansCJK-Regular.ttc")
-
-# 创建字体对象
-CN_FONT = FontProperties(fname=FONT_PATH)
-
-# 设置全局字体
-# 注册字体到matplotlib字体管理器，确保rcParams全局生效
-font_manager.fontManager.addfont(FONT_PATH)
-matplotlib.rcParams["font.family"] = CN_FONT.get_name()
-
-# 防止负号显示成方块
+if not os.path.exists(FONT_PATH):
+    CN_FONT = None
+else:
+    CN_FONT = FontProperties(fname=FONT_PATH)
+    font_manager.fontManager.addfont(FONT_PATH)
+    matplotlib.rcParams["font.family"] = CN_FONT.get_name()
 matplotlib.rcParams["axes.unicode_minus"] = False
 
 st.set_page_config(page_title="课程数据分析助手")
