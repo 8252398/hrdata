@@ -130,6 +130,12 @@ class SQLAgent:
                     continue
 
                 # Execute (supports multiple ;-separated statements)
+                # Auto-fix common CTE syntax errors before execution
+                fixed_sql, fix_note = _auto_fix_cte(sql)
+                if fix_note:
+                    self._log(status_writer, f"🔧 {fix_note.strip()}")
+                    sql = fixed_sql  # Use the auto-fixed version
+
                 try:
                     result, batch_summary = _execute_batch(db, sql)
                     result_summary = (
@@ -157,7 +163,7 @@ class SQLAgent:
                     messages.append({"role": "assistant", "content": content})
                     messages.append({
                         "role": "user",
-                        "content": f"SQL 执行失败: {exc}\n" + _diagnose_cte_error(sql) + "\n请修正 SQL 并重试。",
+                        "content": f"SQL 执行失败: {exc}\n请修正 SQL 并重试。",
                     })
                     self._log(status_writer, f"❌ 执行失败: {exc}")
                     continue
@@ -358,19 +364,47 @@ def _execute_batch(db, sql: str):
     )
 
 
-def _diagnose_cte_error(sql: str) -> str:
-    """Detect common CTE syntax errors and return targeted fix hint."""
-    # Pattern: ) , name AS ( without preceding WITH
+def _auto_fix_cte(sql: str) -> str:
+    """Auto-repair SQL: prepend WITH if CTE definitions are orphaned.
+
+    Pattern detected: SELECT ... ) , cte_name AS ( ...  (missing WITH keyword).
+    Wraps the orphaned SELECT into a CTE and adds WITH prefix.
+    """
     import re
-    if re.search(r"\)\s*,\s*\w+\s+AS\s*\(", sql, re.IGNORECASE):
-        if not sql.strip().upper().startswith("WITH"):
-            return (
-                "SQL 语法错误: 缺少 WITH 关键字。"
-                "你的 SQL 包含多个 CTE 定义 (xxx AS (...))，"
-                "但忘记了在第一个 CTE 前面写 WITH。请修正为:\n"
-                "WITH cte1 AS (SELECT ...), cte2 AS (SELECT ...) SELECT ..."
-            )
-    return ""
+    stripped = sql.strip()
+    upper = stripped.upper()
+
+    # Already has WITH — nothing to fix
+    if upper.startswith("WITH"):
+        return sql, ""
+
+    # Detect orphaned CTE pattern: ) , name AS (
+    m = re.search(r"\)\s*,\s*(\w+)\s+AS\s*\(", stripped, re.IGNORECASE)
+    if not m:
+        return sql, ""
+
+    # Find the first SELECT before the orphaned CTE
+    first_cte_name = m.group(1)
+    closing_paren_pos = m.start()  # position of the )
+
+    # Find the start of the first SELECT
+    before_paren = stripped[:closing_paren_pos]
+    select_start = upper.find("SELECT")
+    if select_start == -1:
+        return sql, ""  # can't determine the first query
+
+    # Build the auto-fixed SQL
+    first_query = stripped[select_start:closing_paren_pos].strip().rstrip(";")
+    auto_cte_name = "auto_cte_0"
+    rest = stripped[closing_paren_pos + 1:].lstrip(",").strip()
+
+    fixed = f"WITH {auto_cte_name} AS (\n  {first_query}\n), {rest}"
+    note = (
+        f"[Auto-fix] Detected missing WITH before CTE. "
+        f"Wrapped orphaned SELECT into CTE \"{auto_cte_name}\". "
+        f"Original first CTE was \"{first_cte_name}\".\n"
+    )
+    return fixed, note
 
 
 # ═══════════════════════════════════════════════════════════
