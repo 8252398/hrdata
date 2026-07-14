@@ -176,7 +176,7 @@ class SQLAgent:
                     or "FINAL SQL" in content_upper
                 )
 
-                if is_final:
+                if is_final or turn == MAX_AGENT_TURNS:
                     self._log(status_writer, "✅ Agent 完成，已生成最终 SQL")
                     # Get explanation
                     explanation = self._get_explanation(
@@ -207,8 +207,21 @@ class SQLAgent:
                                "如果已完成探索，请以 'FINAL:' 开头输出最终检索 SQL。",
                 })
 
-        # Max turns reached
+        # Max turns reached — return last result if any
         self._log(status_writer, "⚠️ 达到最大轮次，返回最后一次结果")
+        if self._history:
+            last = self._history[-1]
+            last_sql = last["sql"]
+            last_result = db.query_to_df(last_sql)
+            last_summary = f"结果: {len(last_result)} 行 x {len(last_result.columns)} 列"
+            explanation = self._get_explanation(llm_client, question, last_summary)
+            return {
+                "sql": last_sql,
+                "result": last_result,
+                "explanation": explanation,
+                "turns": MAX_AGENT_TURNS,
+                "history": self._history,
+            }
         return {
             "sql": "",
             "result": pd.DataFrame({"提示": ["Agent 未能在最大轮次内完成分析"]}),
