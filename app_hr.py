@@ -205,6 +205,15 @@ with tab1:
             for i, (label, val) in enumerate(stats.items()):
                 cols[i].metric(label, val)
 
+        # ER diagram
+        with st.expander("🗂️ 数据库 ER 图", expanded=False):
+            try:
+                from modules.er_diagram import build_er_figure
+                fig = build_er_figure()
+                st.pyplot(fig)
+            except Exception as exc:
+                st.warning(f"ER 图生成失败: {exc}")
+
         if st.session_state.db_reports:
             reports = st.session_state.db_reports
             for phase, report in reports.items():
