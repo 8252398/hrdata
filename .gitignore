@@ -1,29 +1,4 @@
-﻿# Python virtual environment
-venv/
-env/
-.venv/
-
-# Environment variables (contains API key)
-.env
-
-# Python cache
+﻿*.log
+*.db
 __pycache__/
 *.pyc
-*.pyo
-*.egg-info/
-
-# Streamlit
-.streamlit/secrets.toml
-
-# IDE
-.vscode/
-.idea/
-
-# OS
-.DS_Store
-Thumbs.db
-
-# Data files that may contain sensitive info
-*.xlsx
-*.xls
-*.csv
