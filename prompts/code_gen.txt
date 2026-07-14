@@ -1,0 +1,12 @@
+﻿## 数据库 Schema
+{schema}
+
+## 用户问题
+{question}
+
+请生成一条 SQLite SQL 查询。
+- persons 表: employee_code(主键), name, phone, unit, department, cadre_flag
+- training_records 表: employee_code(外键), course_name, hours, study_type, training_type, training_method, organizer, institution, start_date, end_date
+- 两表通过 employee_code 关联
+- 纯 SQL 语句，不要 Markdown 包裹，不要解释
+- 不需要分号结尾
