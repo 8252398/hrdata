@@ -362,4 +362,24 @@ JOIN training_records t ON p.employee_code = t.employee_code
 WHERE p.position IN ('总经理','副总经理','董事长','执行董事')
 AND t.start_date >= '2023-01-01'
 GROUP BY p.employee_code
-ORDER BY total_hours DESC"""
+ORDER BY total_hours DESC
+
+## CTE 写法示例
+如果查询涉及多个中间步骤，必须使用 WITH 关键字定义 CTE。
+正例（正确）：
+WITH step1 AS (
+  SELECT employee_code, SUM(hours) as total FROM training_records GROUP BY employee_code
+), step2 AS (
+  SELECT employee_code FROM step1 WHERE total < 440
+)
+SELECT * FROM training_records WHERE employee_code IN (SELECT employee_code FROM step2)
+
+误例（错误）：
+step1 AS (SELECT ...)
+-- 缺少 WITH 关键字，SQLite 报: near ")" syntax error
+
+记住：
+- CTE 必须以 WITH 开头
+- 多个 CTE 用逗号分隔
+- 最后一个 CTE 后面紧接主查询 SELECT
+- 生成 SQL 后自行检查: 是否有 AS ( 但没有前置 WITH ?"""
