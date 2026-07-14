@@ -153,7 +153,7 @@ class SQLAgent:
                     messages.append({"role": "assistant", "content": content})
                     messages.append({
                         "role": "user",
-                        "content": f"SQL 执行失败: {exc}\n请修正 SQL 并重试。",
+                        "content": f"SQL 执行失败: {exc}\n" + _diagnose_cte_error(sql) + "\n请修正 SQL 并重试。",
                     })
                     self._log(status_writer, f"❌ 执行失败: {exc}")
                     continue
@@ -309,6 +309,21 @@ def _extract_sql(text: str) -> str:
             return "\n".join(sql_part)
 
     return text.rstrip(";")
+
+
+def _diagnose_cte_error(sql: str) -> str:
+    """Detect common CTE syntax errors and return targeted fix hint."""
+    # Pattern: ) , name AS ( without preceding WITH
+    import re
+    if re.search(r"\)\s*,\s*\w+\s+AS\s*\(", sql, re.IGNORECASE):
+        if not sql.strip().upper().startswith("WITH"):
+            return (
+                "SQL 语法错误: 缺少 WITH 关键字。"
+                "你的 SQL 包含多个 CTE 定义 (xxx AS (...))，"
+                "但忘记了在第一个 CTE 前面写 WITH。请修正为:\n"
+                "WITH cte1 AS (SELECT ...), cte2 AS (SELECT ...) SELECT ..."
+            )
+    return ""
 
 
 # ═══════════════════════════════════════════════════════════
