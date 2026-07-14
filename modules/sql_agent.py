@@ -16,7 +16,7 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-MAX_AGENT_TURNS = 8  # prevent infinite loops
+MAX_AGENT_TURNS = 6  # prevent infinite loops
 
 # Read-only SQL whitelist
 _FORBIDDEN_KEYWORDS = [
@@ -415,6 +415,7 @@ _SYSTEM_PROMPT = """你是一名 SQLite 数据分析助手。
 
 ## 核心原则
 先观察数据库，再推理，最后查询。不要凭空猜测。
+最多探索 3-4 轮，之后必须生成 FINAL SQL，即使理解不完美。
 
 ## 工作流程
 1. 查看数据库结构（PRAGMA table_info）
@@ -429,6 +430,8 @@ _SYSTEM_PROMPT = """你是一名 SQLite 数据分析助手。
 - 不确定课程类别 → 先 SELECT DISTINCT course_name
 - 不确定培训方式 → 先 SELECT DISTINCT training_method
 - 遇到模糊概念（班子成员、中层干部、年轻干部、数字化课程等）→ 先查数据库
+- 若精确值未找到 → 用 LIKE %关键词% 模糊匹配，不要反复探索同一字段
+- 探索超过 3 轮未找到精确概念 → 直接用模糊匹配生成 FINAL SQL
 - 宁可多查，不要乱猜
 - 宁可扩大召回，不要漏掉相关数据
 
