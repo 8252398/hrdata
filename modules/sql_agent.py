@@ -126,12 +126,13 @@ class SQLAgent:
                     self._log(status_writer, f"⚠️ 校验失败: {reason}")
                     continue
 
-                # Execute
+                # Execute (supports multiple ;-separated statements)
                 try:
-                    result = db.query_to_df(sql)
+                    result, batch_summary = _execute_batch(db, sql)
                     result_summary = (
-                        f"查询结果: {len(result)} 行 × {len(result.columns)} 列\n"
-                        f"列: {', '.join(list(result.columns)[:10])}\n"
+                        (batch_summary + "\n" if batch_summary else "")
+                        + f"查询结果: {len(result)} 行 x {len(result.columns)} 列\n"
+                        + f"列: {', '.join(list(result.columns)[:10])}\n"
                     )
                     if len(result) <= 20:
                         result_summary += result.to_markdown(index=False)
@@ -309,6 +310,49 @@ def _extract_sql(text: str) -> str:
             return "\n".join(sql_part)
 
     return text.rstrip(";")
+
+
+
+
+def _split_statements(sql: str) -> list[str]:
+    """Split multi-statement SQL into individual statements by semicolon."""
+    parts = sql.split(";")
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _execute_batch(db, sql: str):
+    """Execute potentially multi-statement SQL.
+    
+    If multiple statements detected, executes each one independently.
+    Returns (last_result_df, combined_summary_str) tuple.
+    """
+    import pandas as pd
+
+    stmts = _split_statements(sql)
+    if len(stmts) <= 1:
+        result = db.query_to_df(sql)
+        return result, ""
+
+    summaries = []
+    last_result = None
+    for i, stmt in enumerate(stmts, 1):
+        try:
+            r = db.query_to_df(stmt)
+            last_result = r
+            summaries.append(
+                f"  [{i}] {stmt[:60]}... -> {len(r)} 行 x {len(r.columns)} 列"
+            )
+        except Exception as exc:
+            summaries.append(f"  [{i}] {stmt[:60]}... -> FAIL: {exc}")
+
+    summary = (
+        f"Batch executed {len(stmts)} SQLs:\n"
+        + "\n".join(summaries)
+    )
+    return (
+        last_result if last_result is not None else pd.DataFrame({"info": ["All done"]}),
+        summary,
+    )
 
 
 def _diagnose_cte_error(sql: str) -> str:
