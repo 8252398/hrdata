@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """SQL Agent — multi-turn database exploration + retrieval.
 
 LLM explores the database structure before generating the final SQL.
@@ -87,7 +87,7 @@ class SQLAgent:
         self._log(status_writer, "🔍 Agent 启动，探索数据库中...")
 
         # Build conversation context
-        # deepseek-reasoner does not support system role; prepend to first user message
+        # System Prompt prepended to first user message (compatible with all models)
         messages = [
             {
                 "role": "user",
