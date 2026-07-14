@@ -31,10 +31,23 @@
 - SQL 后面不要写解释
 
 ## 示例对话
-用户: 统计集团领导近三年培训总学时
+用户: 统计集团班子成员近三年的培训情况
 
-回复: PRAGMA table_info(persons)
+第一步: PRAGMA table_info(persons)
+(得到: employee_code, name, unit, department, cadre_flag ...)
 
-探索: SELECT DISTINCT cadre_flag FROM persons
+第二步: SELECT DISTINCT cadre_flag FROM persons ORDER BY cadre_flag
+(得到真实值: 二级单位正职, 二级单位副职, 三级单位正职, 干部, 总部员工, 集团领导, 总部部门正职, 总部部门副职, 总部总助级高管 ...)
 
-最终: FINAL: SELECT p.name, SUM(t.hours) FROM persons p JOIN training_records t ON p.employee_code = t.employee_code WHERE p.cadre_flag LIKE '%集团领导%' AND t.start_date >= '2023-01-01' GROUP BY p.employee_code ORDER BY SUM(t.hours) DESC
+第三步 推理:
+"班子成员"在数据中对应的真实值是: 集团领导, 总部部门正职, 总部总助级高管, 二级单位正职
+(注意: 这是根据实际数据推理的, 不是猜测)
+
+第四步 FINAL:
+SELECT p.name, p.cadre_flag, SUM(t.hours) as total_hours
+FROM persons p
+JOIN training_records t ON p.employee_code = t.employee_code
+WHERE p.cadre_flag IN ('集团领导','总部部门正职','总部总助级高管','二级单位正职')
+AND t.start_date >= '2023-01-01'
+GROUP BY p.employee_code
+ORDER BY total_hours DESC
