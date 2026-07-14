@@ -217,7 +217,7 @@ with tab1:
                             st.caption(f"- {err}")
 
 # ═══════════════════════════════════════════════════════════
-# Tab 2: AI Analysis (SQL-based)
+# Tab 2: AI Analysis (SQL Agent)
 # ═══════════════════════════════════════════════════════════
 
 with tab2:
@@ -234,6 +234,11 @@ with tab2:
                 if msg["role"] == "assistant" and "code" in msg:
                     with st.expander("🔧 查看生成的 SQL", expanded=False):
                         st.code(msg["code"], language="sql")
+                if msg["role"] == "assistant" and "history" in msg:
+                    with st.expander(f"📋 Agent 探索过程（{len(msg['history'])} 轮）", expanded=False):
+                        for h in msg["history"]:
+                            st.caption(f"第{h['turn']}轮: {h['rows']}行")
+                            st.code(h["sql"], language="sql")
                 st.markdown(msg["content"])
 
         if question := st.chat_input("输入你的分析问题，例如：统计各部门的培训总学时"):
@@ -243,7 +248,7 @@ with tab2:
                 st.markdown(question)
 
             with st.chat_message("assistant"):
-                status = st.status("AI 分析中...", expanded=True)
+                status = st.status("AI Agent 分析中...", expanded=True)
 
                 try:
                     # 1. Build LLM client
@@ -254,64 +259,43 @@ with tab2:
                         base_url=st.session_state.llm_base,
                     )
 
-                    # 2. Build SQL generation prompt
-                    pb = PromptBuilder()
-                    system_prompt, user_prompt = pb.build_sql_prompt(
-                        schema_text=st.session_state.db_schema_text,
-                        question=question,
-                    )
-                    status.write("📤 已发送分析请求...")
-
-                    # 3. Get SQL from LLM
-                    raw_response = client.chat(
-                        user_message=user_prompt,
-                        system_message=system_prompt,
-                    )
-                    status.write("📥 已收到 AI 响应...")
-
-                    # 4. Extract SQL
-                    sql = _extract_sql(raw_response)
-                    status.write(f"🔍 SQL 提取完成: {len(sql)} 字符")
-
-                    # 5. Execute SQL against SQLite
+                    # 2. Run SQL Agent
+                    from modules.sql_agent import SQLAgent
+                    agent = SQLAgent()
                     db = TrainingDatabase()
-                    result = db.query_to_df(sql)
-                    db.close()
-                    status.write(f"⚡ SQL 执行完成: {len(result)} 行 × {len(result.columns)} 列")
 
-                    # 6. Build explanation
-                    if isinstance(result, pd.DataFrame) and not result.empty:
-                        summary_text = (
-                            f"结果: {len(result)} 行 × {len(result.columns)} 列, "
-                            f"列: {', '.join(result.columns[:8])}"
-                        )
-                    elif isinstance(result, pd.DataFrame):
-                        summary_text = "查询结果为空"
-                    else:
-                        summary_text = str(result)[:500]
-
-                    expl_system, expl_prompt = pb.build_explanation_prompt(
+                    result = agent.run(
                         question=question,
-                        summary=summary_text,
+                        llm_client=client,
+                        db=db,
+                        status_writer=status,
                     )
-                    explanation = client.chat(
-                        user_message=expl_prompt,
-                        system_message=expl_system,
+                    db.close()
+
+                    final_sql = result["sql"]
+                    final_df = result["result"]
+                    explanation = result["explanation"]
+                    turns = result["turns"]
+                    history = result["history"]
+
+                    status.update(
+                        label=f"✅ Agent 完成（{turns} 轮探索）",
+                        state="complete",
                     )
 
-                    status.update(label="✅ 分析完成", state="complete")
-
-                    # 7. Display
+                    # 3. Display
+                    st.caption(f"共探索 {turns} 轮，生成最终 SQL:")
+                    st.code(final_sql, language="sql")
                     st.markdown(explanation.strip())
 
-                    if isinstance(result, pd.DataFrame) and not result.empty:
+                    if isinstance(final_df, pd.DataFrame) and not final_df.empty:
                         st.dataframe(
-                            result,
+                            final_df,
                             use_container_width=True,
-                            height=min(500, 35 * len(result) + 38),
+                            height=min(500, 35 * len(final_df) + 38),
                         )
                         buf = io.BytesIO()
-                        result.to_excel(buf, index=False, engine="openpyxl")
+                        final_df.to_excel(buf, index=False, engine="openpyxl")
                         st.download_button(
                             "📥 下载结果 Excel",
                             buf.getvalue(),
@@ -319,22 +303,23 @@ with tab2:
                             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                             key=f"dl_{len(st.session_state.chat_history)}",
                         )
-                    elif isinstance(result, pd.DataFrame):
+                    elif isinstance(final_df, pd.DataFrame):
                         st.info("查询结果为空")
                     else:
-                        st.metric("结果", str(result))
+                        st.metric("结果", str(final_df))
 
                     st.session_state.chat_history.append({
                         "role": "assistant",
                         "content": explanation.strip(),
-                        "code": sql,
+                        "code": final_sql,
+                        "history": history,
                     })
 
                 except Exception as exc:
-                    status.update(label="❌ 分析失败", state="error")
+                    status.update(label="❌ Agent 分析失败", state="error")
                     st.error(f"分析失败: {exc}")
-                    logger.exception("Analysis pipeline failed")
-                    _add_error_to_history(str(exc), sql if "sql" in dir() else "")
+                    logger.exception("Agent analysis failed")
+                    _add_error_to_history(str(exc))
 
 
 # ═══════════════════════════════════════════════════════════
