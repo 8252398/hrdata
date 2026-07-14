@@ -89,6 +89,7 @@ class LLMClient:
                 temperature=temperature,
                 max_tokens=max_tokens,
                 timeout=timeout,
+                extra_body={"thinking": {"type": "enabled"}},
             )
             content = response.choices[0].message.content or ""
             logger.info("Chat response: %d chars", len(content))

@@ -22,19 +22,20 @@ DB_PATH = DATA_DIR / "training.db"
 @dataclass
 class LLMConfig:
     provider: str = "deepseek"
-    model: str = "deepseek-reasoner"
+    model: str = "deepseek-v4-pro"
     api_key: str = ""
     base_url: str = "https://api.deepseek.com"
-    temperature: float = 1.0  # reasoner requires 1.0
+    temperature: float = 1.0
     max_tokens: int = 4096
     timeout: int = 180
+    thinking_enabled: bool = True  # deepseek-v4-pro thinking mode
 
 
 # ---- Supported providers ----
 LLM_PROVIDERS = {
     "deepseek": LLMConfig(
         provider="deepseek",
-        model="deepseek-reasoner",
+        model="deepseek-v4-pro",
         base_url="https://api.deepseek.com",
     ),
     "openai": LLMConfig(
