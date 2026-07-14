@@ -87,11 +87,14 @@ class SQLAgent:
         self._log(status_writer, "🔍 Agent 启动，探索数据库中...")
 
         # Build conversation context
+        # deepseek-reasoner does not support system role; prepend to first user message
         messages = [
-            {"role": "system", "content": _SYSTEM_PROMPT},
             {
                 "role": "user",
-                "content": f"## 数据库 Schema\n{schema_text}\n\n## 用户问题\n{question}",
+                "content": (
+                    f"[System Instructions]\n{_SYSTEM_PROMPT}\n\n"
+                    f"## 数据库 Schema\n{schema_text}\n\n## 用户问题\n{question}"
+                ),
             },
         ]
 

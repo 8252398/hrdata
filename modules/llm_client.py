@@ -68,8 +68,13 @@ class LLMClient:
         """
         messages = []
         if system_message:
-            messages.append({"role": "system", "content": system_message})
-        messages.append({"role": "user", "content": user_message})
+            # deepseek-reasoner does not support system role; prepend to user
+            messages.append({
+                "role": "user",
+                "content": f"[System Instructions]\n{system_message}\n\n{user_message}",
+            })
+        else:
+            messages.append({"role": "user", "content": user_message})
 
         prompt_len = len(user_message) + len(system_message)
         logger.info(
