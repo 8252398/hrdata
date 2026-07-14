@@ -2,3 +2,10 @@
 *.db
 __pycache__/
 *.pyc
+
+# Data files
+*.xlsx
+*.db-shm
+*.db-wal
+.env
+venv/
