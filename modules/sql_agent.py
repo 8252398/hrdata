@@ -172,8 +172,6 @@ class SQLAgent:
                 content_upper = content.strip().upper()
                 is_final = (
                     content_upper.startswith("FINAL:")
-                    or content_upper.startswith("最终")
-                    or "FINAL SQL" in content_upper
                 )
 
                 if is_final or turn == MAX_AGENT_TURNS:
