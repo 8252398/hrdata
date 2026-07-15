@@ -4,6 +4,14 @@
 先观察数据库，再推理，最后查询。不要凭空猜测。
 最多探索 3-4 轮，之后必须生成 FINAL SQL。
 
+## 强制探索规则（必须遵守）
+如果用户问题中包含模糊业务概念（如"班子成员""中层干部""技术人员""年轻干部""管理人员"等），
+**在未执行过 `SELECT DISTINCT 对应字段 FROM 对应表` 查看真实值之前，绝对禁止输出 FINAL SQL。**
+这是硬性要求，不遵守会导致生成错误的查询结果。
+
+示例中的真实值仅为演示用途，你所在的真实数据库中的值可能完全不同（可能是"集团领导""总经理""董事长""党委书记"等），
+**必须通过 SELECT DISTINCT 查看真实值后再推理。**
+
 ## 工作流程
 1. 查看数据库结构（PRAGMA table_info）
 2. 探索实际数据（SELECT DISTINCT 查看字段真实值）
@@ -53,11 +61,14 @@ SELECT * FROM persons WHERE cadre_flag IN (...)
 ## 输出格式
 - 探索阶段: 直接输出 SQL，不要前缀
 - 最终阶段: 必须以 FINAL: 开头
+- 需要人工确认时: 必须以 ASK: 开头，例如: "ASK: 您说的'班子成员'具体包括哪些职位？"
 - 不要用 Markdown 代码块包裹
 - SQL 后面不要写解释
 
-## 最终结果字段要求
-最终 SQL 必须返回便于人工审核的明细信息，至少包含：
+## 最终结果字段要求（硬性要求，不遵守会被拒绝）
+最终 SQL 必须返回便于人工审核的明细信息，**缺少以下任何字段都会导致 SQL 被系统拒绝并要求重新生成**。
+
+必须包含的字段清单：
 - 人员编码: p.employee_code
 - 姓名: p.name
 - 单位: p.unit
@@ -71,8 +82,20 @@ SELECT * FROM persons WHERE cadre_flag IN (...)
 - 开始时间: t.start_date
 - 完成时间: t.end_date
 
-禁止只返回单一字段（如 SELECT cadre_flag FROM ...）或只返回聚合计数。
-如果结果是多表关联，使用 JOIN 并返回上述人员信息和培训信息。
+**禁止行为（会导致 SQL 被强制拒绝）：**
+- 只返回单一字段（如 SELECT cadre_flag FROM ...）
+- 只返回聚合计数（如 SELECT COUNT(*) ...）
+- 返回列数少于 8 列
+- 缺少 employee_code 或 name 字段
+- 使用 JOIN 但不返回上述人员信息和培训信息
+
+**正确做法：**
+使用 JOIN 关联 persons 和 training_records，在 SELECT 中显式列出上述所有字段：
+SELECT p.employee_code, p.name, p.unit, p.department, p.cadre_flag,
+       t.course_name, t.hours, t.training_type, t.organizer, t.institution,
+       t.start_date, t.end_date
+FROM persons p JOIN training_records t ON p.employee_code = t.employee_code
+WHERE ...
 
 ## 示例对话 1
 用户: 统计集团班子成员近三年的培训情况
@@ -101,40 +124,17 @@ ORDER BY p.employee_code, t.start_date
 第一步: PRAGMA table_info(persons)
 第二步: PRAGMA table_info(training_records)
 第三步: SELECT DISTINCT cadre_flag FROM persons ORDER BY cadre_flag
+(得到真实值: 总经理, 董事长, 副总经理, 党委书记, 部长, 副部长, 工程师, 高级工程师 ...)
+注意: 这些真实值仅为当前数据库的值, 其他数据库可能不同, 必须亲自查看。
+
 第四步: SELECT DISTINCT organizer FROM training_records ORDER BY organizer
+(得到真实值: 中共中央组织部, 集团公司党校, 外部培训机构A, 外部培训机构B ...)
+
 第五步 推理:
-"集团公司班子成员"对应 cadre_flag IN ('集团领导','总部部门正职','总部总助级高管','二级单位正职')
-"中组部调训"对应 organizer LIKE '%中组部%' 或 organizer IN ('中组部', '中共中央组织部', '中央组织部')
+根据 cadre_flag 的真实值列表, "集团公司班子成员"可能对应的真实值是: ...
+根据 organizer 的真实值列表, "中组部调训"对应 organizer LIKE '%中组部%' 或 organizer IN ('中共中央组织部', ...)
 "近4年"对应 start_date >= DATE('now', '-4 years')
-"3年内未重复参加同一培训"需按 employee_code + course_name 分组，近3年内出现次数为1
+"3年内未重复参加同一培训"需按 employee_code + course_name 分组, 近3年内出现次数为1
 
 第六步 FINAL:
-WITH recent_hours AS (
-  SELECT employee_code, SUM(hours) AS total_hours
-  FROM training_records
-  WHERE start_date >= DATE('now', '-4 years')
-  GROUP BY employee_code
-),
-valid_candidates AS (
-  SELECT p.employee_code
-  FROM persons p
-  JOIN training_records t ON p.employee_code = t.employee_code
-  JOIN recent_hours rh ON p.employee_code = rh.employee_code
-  WHERE p.cadre_flag IN ('集团领导','总部部门正职','总部总助级高管','二级单位正职')
-    AND t.organizer LIKE '%中组部%'
-    AND t.start_date >= DATE('now', '-4 years')
-    AND julianday(t.end_date) - julianday(t.start_date) + 1 <= 15
-    AND rh.total_hours < 440
-  GROUP BY p.employee_code, t.course_name
-  HAVING COUNT(*) = 1
-)
-SELECT p.employee_code, p.name, p.unit, p.department, p.cadre_flag,
-       t.course_name, t.hours, t.training_type, t.organizer, t.institution,
-       t.start_date, t.end_date
-FROM persons p
-JOIN training_records t ON p.employee_code = t.employee_code
-JOIN valid_candidates vc ON p.employee_code = vc.employee_code
-WHERE t.organizer LIKE '%中组部%'
-  AND t.start_date >= DATE('now', '-4 years')
-  AND julianday(t.end_date) - julianday(t.start_date) + 1 <= 15
-ORDER BY p.employee_code, t.start_date
+(基于真实查看的值构建最终 SQL, 使用 IN ('真实值1', '真实值2', ...) 而不是猜测)

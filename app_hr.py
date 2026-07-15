@@ -38,6 +38,9 @@ DEFAULTS = {
     "chat_history": [],
     "llm_configured": False,
     "db_schema_text": "",
+    "agent_gen": None,       # active generator from SQLAgent.run_iter()
+    "agent_event": None,     # last event yielded by the agent
+    "awaiting_answer": False,  # UI is showing an AI question
 }
 for key, val in DEFAULTS.items():
     if key not in st.session_state:
@@ -73,6 +76,36 @@ def _add_error_to_history(error_msg: str, code: str = "") -> None:
         "content": f"❌ {error_msg}",
         "code": code,
     })
+
+
+def _drive_agent_step(answer: str | None = None) -> dict | None:
+    """Advance the SQLAgent generator by one step.
+
+    If answer is provided, sends it to the generator (resumes from ASK).
+    Otherwise, calls next() to start or continue.
+    Stores the yielded event in st.session_state.agent_event.
+    """
+    gen = st.session_state.agent_gen
+    if gen is None:
+        return None
+    try:
+        if answer is not None:
+            event = gen.send(answer)
+        else:
+            event = next(gen)
+    except StopIteration:
+        st.session_state.agent_gen = None
+        st.session_state.awaiting_answer = False
+        return None
+    st.session_state.agent_event = event
+    if event["type"] == "ask":
+        st.session_state.awaiting_answer = True
+    elif event["type"] == "result":
+        st.session_state.agent_gen = None
+        st.session_state.awaiting_answer = False
+    else:
+        st.session_state.awaiting_answer = False
+    return event
 
 
 def _build_db_schema_text(db_stats: dict) -> str:
@@ -250,85 +283,149 @@ with tab2:
                             st.code(h["sql"], language="sql")
                 st.markdown(msg["content"])
 
-        if question := st.chat_input("输入你的分析问题，例如：统计各部门的培训总学时"):
-            st.session_state.chat_history.append({"role": "user", "content": question})
-
-            with st.chat_message("user"):
-                st.markdown(question)
-
+        # ── Human-in-the-loop agent UI ──
+        # If we are waiting for an answer to an AI question, show the form
+        if st.session_state.awaiting_answer:
+            event = st.session_state.agent_event
             with st.chat_message("assistant"):
-                status = st.status("AI Agent 分析中...", expanded=True)
-
-                try:
-                    # 1. Build LLM client
-                    client = LLMClient(
-                        api_key=st.session_state.llm_key,
-                        provider=st.session_state.llm_provider,
-                        model=st.session_state.llm_model,
-                        base_url=st.session_state.llm_base,
+                st.markdown(f"**❓ AI 提问：** {event['text']}")
+                with st.form(key="agent_ask_form", clear_on_submit=True):
+                    human_answer = st.text_input(
+                        "请输入你的回答：", key="human_answer_input"
                     )
-
-                    # 2. Run SQL Agent
-                    from modules.sql_agent import SQLAgent
-                    agent = SQLAgent()
-                    db = TrainingDatabase()
-
-                    result = agent.run(
-                        question=question,
-                        llm_client=client,
-                        db=db,
-                        status_writer=status,
-                    )
-                    db.close()
-
-                    final_sql = result["sql"]
-                    final_df = result["result"]
-                    explanation = result["explanation"]
-                    turns = result["turns"]
-                    history = result["history"]
-
-                    status.update(
-                        label=f"✅ Agent 完成（{turns} 轮探索）",
-                        state="complete",
-                    )
-
-                    # 3. Display
-                    st.caption(f"共探索 {turns} 轮，生成最终 SQL:")
-                    st.code(final_sql, language="sql")
-                    st.markdown(explanation.strip())
-
-                    if isinstance(final_df, pd.DataFrame) and not final_df.empty:
-                        st.dataframe(
-                            final_df,
-                            use_container_width=True,
-                            height=min(500, 35 * len(final_df) + 38),
-                        )
-                        buf = io.BytesIO()
-                        final_df.to_excel(buf, index=False, engine="openpyxl")
-                        st.download_button(
-                            "📥 下载结果 Excel",
-                            buf.getvalue(),
-                            "analysis_result.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                            key=f"dl_{len(st.session_state.chat_history)}",
-                        )
-                    elif isinstance(final_df, pd.DataFrame):
-                        st.info("查询结果为空")
-                    else:
-                        st.metric("结果", str(final_df))
-
+                    submitted = st.form_submit_button("💬 提交回答，继续分析")
+                if submitted and human_answer:
                     st.session_state.chat_history.append({
                         "role": "assistant",
-                        "content": explanation.strip(),
-                        "code": final_sql,
-                        "history": history,
+                        "content": f"❓ {event['text']}",
                     })
+                    st.session_state.chat_history.append({
+                        "role": "user",
+                        "content": human_answer,
+                    })
+                    # Resume generator with the human answer
+                    _drive_agent_step(answer=human_answer)
+                    st.rerun()
 
-                except Exception as exc:
-                    status.update(label="❌ Agent 分析失败", state="error")
-                    st.error(f"分析失败: {exc}")
-                    logger.exception("Agent analysis failed")
-                    _add_error_to_history(str(exc))
+        # Normal chat input (only active when NOT awaiting answer)
+        if not st.session_state.awaiting_answer:
+            if question := st.chat_input(
+                "输入你的分析问题，例如：统计各部门的培训总学时"
+            ):
+                st.session_state.chat_history.append(
+                    {"role": "user", "content": question}
+                )
+
+                with st.chat_message("user"):
+                    st.markdown(question)
+
+                with st.chat_message("assistant"):
+                    status = st.status("AI Agent 分析中...", expanded=True)
+
+                    try:
+                        # 1. Build LLM client
+                        client = LLMClient(
+                            api_key=st.session_state.llm_key,
+                            provider=st.session_state.llm_provider,
+                            model=st.session_state.llm_model,
+                            base_url=st.session_state.llm_base,
+                        )
+
+                        # 2. Initialise generator-driven agent
+                        from modules.sql_agent import SQLAgent
+                        agent = SQLAgent()
+                        db = TrainingDatabase()
+
+                        st.session_state.agent_gen = agent.run_iter(
+                            question=question,
+                            llm_client=client,
+                            db=db,
+                            status_writer=status,
+                        )
+
+                        # 3. Drive generator until ask or result
+                        while True:
+                            event = _drive_agent_step()
+                            if event is None:
+                                break
+                            if event["type"] == "status":
+                                status.write(event["msg"])
+                            elif event["type"] == "sql":
+                                status.write(
+                                    f"⚡ 执行 SQL ({'探索' if event['exploratory'] else '最终'}): "
+                                    f"{event['rows']} 行"
+                                )
+                            elif event["type"] == "ask":
+                                # Generator paused — store question and
+                                # trigger a rerun so the ask form appears
+                                status.update(
+                                    label="❓ AI 需要更多信息",
+                                    state="running",
+                                )
+                                st.rerun()
+                            elif event["type"] == "result":
+                                break
+
+                        # 4. Handle result (or fall-through if ask)
+                        result_event = st.session_state.agent_event
+                        if result_event and result_event["type"] == "result":
+                            final_sql = result_event["sql"]
+                            final_df = result_event["result"]
+                            explanation = result_event["explanation"]
+                            turns = result_event["turns"]
+                            history = result_event["history"]
+
+                            status.update(
+                                label=f"✅ Agent 完成（{turns} 轮探索）",
+                                state="complete",
+                            )
+
+                            st.caption(f"共探索 {turns} 轮，生成最终 SQL:")
+                            st.code(final_sql, language="sql")
+                            st.markdown(explanation.strip())
+
+                            if (
+                                isinstance(final_df, pd.DataFrame)
+                                and not final_df.empty
+                            ):
+                                st.dataframe(
+                                    final_df,
+                                    use_container_width=True,
+                                    height=min(500, 35 * len(final_df) + 38),
+                                )
+                                buf = io.BytesIO()
+                                final_df.to_excel(
+                                    buf, index=False, engine="openpyxl"
+                                )
+                                st.download_button(
+                                    "📥 下载结果 Excel",
+                                    buf.getvalue(),
+                                    "analysis_result.xlsx",
+                                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                                    key=f"dl_{len(st.session_state.chat_history)}",
+                                )
+                            elif isinstance(final_df, pd.DataFrame):
+                                st.info("查询结果为空")
+                            else:
+                                st.metric("结果", str(final_df))
+
+                            st.session_state.chat_history.append({
+                                "role": "assistant",
+                                "content": explanation.strip(),
+                                "code": final_sql,
+                                "history": history,
+                            })
+                        else:
+                            # Ask form will render on next rerun
+                            pass
+
+                        db.close()
+
+                    except Exception as exc:
+                        status.update(label="❌ Agent 分析失败", state="error")
+                        st.error(f"分析失败: {exc}")
+                        logger.exception("Agent analysis failed")
+                        _add_error_to_history(str(exc))
 
 
 # ═══════════════════════════════════════════════════════════

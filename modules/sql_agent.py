@@ -19,11 +19,136 @@ logger = get_logger(__name__)
 
 MAX_AGENT_TURNS = 8  # prevent infinite loops
 
+# Fuzzy business concepts that MUST be explored via SELECT DISTINCT before FINAL
+_FUZZY_CONCEPTS = [
+    "班子成员", "中层干部", "技术人员", "年轻干部", "管理人员",
+    "领导干部", "集团领导", "核心人员", "关键岗位", "骨干",
+    "干部", "领导", "班子", "管理层", "高管",
+]
+
+# Fields that should be explored when fuzzy concepts appear
+_EXPLORATION_FIELDS = {
+    "cadre_flag": ("persons", "干部标识/身份标签"),
+    "organizer": ("training_records", "主办单位/培训机构"),
+    "training_type": ("training_records", "培训类型"),
+    "department": ("persons", "部门名称"),
+    "unit": ("persons", "单位名称"),
+}
+
+# Required columns for FINAL SQL result (must have detailed fields for human audit)
+_REQUIRED_COLUMNS = {
+    "employee_code": "人员编码",
+    "name": "姓名",
+    "unit": "单位",
+    "department": "部门",
+    "cadre_flag": "干部标识",
+    "course_name": "培训名称",
+    "hours": "学时",
+    "training_type": "培训类型",
+    "organizer": "主办单位",
+    "institution": "培训机构",
+    "start_date": "开始时间",
+    "end_date": "完成时间",
+}
+
+# Minimum column count for FINAL SQL to prevent single-field returns
+_MIN_FINAL_COLUMNS = 8
+
 # Read-only SQL whitelist
 _FORBIDDEN_KEYWORDS = [
     "INSERT", "UPDATE", "DELETE", "DROP", "ALTER",
     "CREATE", "ATTACH", "DETACH", "REPLACE",
 ]
+
+
+def _check_mandatory_exploration(
+    question: str,
+    history: list[dict],
+    current_sql: str,
+) -> str:
+    """Check whether required exploration has been performed before FINAL.
+
+    Returns:
+        Empty string if exploration is sufficient, otherwise a message
+        describing what exploration is still required.
+    """
+    upper_q = question.upper()
+
+    # Detect which fuzzy concepts appear in the question
+    matched_concepts = [c for c in _FUZZY_CONCEPTS if c in question]
+    if not matched_concepts:
+        return ""  # no fuzzy concepts, no mandatory exploration
+
+    # Check what DISTINCT explorations have already been executed
+    explored_fields = set()
+    for h in history:
+        if not h.get("exploratory", False):
+            continue
+        sql_upper = h.get("sql", "").upper()
+        for field in _EXPLORATION_FIELDS:
+            if f"DISTINCT {field.upper()}" in sql_upper:
+                explored_fields.add(field)
+
+    # Determine which fields need exploration based on matched concepts
+    required_fields = set()
+    # cadre_flag / 干部相关
+    if any(c in question for c in ["班子成员", "中层干部", "干部", "领导", "班子", "管理层", "高管", "集团领导"]):
+        required_fields.add("cadre_flag")
+    # organizer / 培训单位相关
+    if any(c in question for c in ["中组部", "调训", "主办单位", "培训机构", "党校"]):
+        required_fields.add("organizer")
+    # department / 部门相关
+    if any(c in question for c in ["部门"]):
+        required_fields.add("department")
+    # unit / 单位相关
+    if any(c in question for c in ["单位"]):
+        required_fields.add("unit")
+    # training_type / 培训类型相关
+    if any(c in question for c in ["培训类型", "培训方式", "学习类型"]):
+        required_fields.add("training_type")
+
+    missing = required_fields - explored_fields
+    if not missing:
+        return ""
+
+    messages = []
+    for field in sorted(missing):
+        table, desc = _EXPLORATION_FIELDS[field]
+        messages.append(
+            f"请先执行: SELECT DISTINCT {field} FROM {table} ORDER BY {field} "
+            f"（查看{desc}的真实值）"
+        )
+    return "; ".join(messages)
+
+
+def _check_final_columns(result_df, is_final: bool) -> str:
+    """Check whether FINAL SQL result contains required detailed columns.
+
+    Returns:
+        Empty string if columns are sufficient, otherwise a message
+        describing what is missing.
+    """
+    if not is_final:
+        return ""
+
+    cols = [c.lower() for c in result_df.columns]
+
+    # Must have enough columns (prevent single-field return like SELECT cadre_flag)
+    if len(cols) < _MIN_FINAL_COLUMNS:
+        return (
+            f"结果只有 {len(cols)} 列，至少需要 {_MIN_FINAL_COLUMNS} 列以上明细字段。"
+            f"当前列: {', '.join(result_df.columns)}"
+        )
+
+    missing = []
+    for col_key, col_desc in _REQUIRED_COLUMNS.items():
+        if col_key not in cols:
+            missing.append(f"{col_desc} ({col_key})")
+
+    if missing:
+        return f"缺少字段: {', '.join(missing)}"
+
+    return ""
 
 
 def validate_sql(sql: str) -> tuple[bool, str]:
@@ -61,31 +186,37 @@ class SQLAgent:
         self._db: Optional[TrainingDatabase] = None
         self._history: list[dict] = []  # {role, content, sql?, result?}
 
-    def run(
+    def run_iter(
         self,
         question: str,
         llm_client,  # LLMClient instance
         db: TrainingDatabase,
         status_writer=None,  # optional st.status() for Streamlit progress
-    ) -> dict:
-        """Run the full agent loop.
+    ):
+        """Generator-based agent loop with human-in-the-loop support.
 
-        Args:
-            question: User's natural language question.
-            llm_client: Configured LLMClient instance.
-            db: Connected TrainingDatabase instance.
-            status_writer: Optional callback for progress messages.
+        Yields event dicts. The caller drives the loop.
 
-        Returns:
-            dict with keys: sql (final SQL), result (DataFrame),
-            explanation (str), turns (int), history (list).
+        Event types:
+            - {"type": "status", "msg": str}
+            - {"type": "sql", "sql": str, "rows": int, "exploratory": bool}
+            - {"type": "ask", "text": str}   ← human must answer via .send()
+            - {"type": "result", "sql": str, "result": DataFrame,
+               "explanation": str, "turns": int, "history": list}
+
+        Usage:
+            gen = agent.run_iter(...)
+            event = next(gen)                # drive until ask/result
+            if event["type"] == "ask":
+                answer = get_human_input()
+                event = gen.send(answer)     # resume with answer
         """
         self._db = db
         self._history = []
 
         # Step 0: Get schema and build prompt
         schema_text = self._get_schema()
-        self._log(status_writer, "🔍 Agent 启动，探索数据库中...")
+        yield {"type": "status", "msg": "🔍 Agent 启动，探索数据库中..."}
 
         prompt_builder = PromptBuilder()
         system_prompt, initial_user = prompt_builder.build_sql_prompt(
@@ -101,8 +232,15 @@ class SQLAgent:
             },
         ]
 
+        _human_answer = None  # holds answer from .send() when agent asks
+
         for turn in range(1, MAX_AGENT_TURNS + 1):
-            self._log(status_writer, f"🔄 第 {turn} 轮对话...")
+            yield {"type": "status", "msg": f"🔄 第 {turn} 轮对话..."}
+
+            # Inject human answer if we resumed from an ASK event
+            if _human_answer is not None:
+                messages.append({"role": "user", "content": _human_answer})
+                _human_answer = None
 
             # Trim conversation if it grows too long
             messages = self._trim_messages(messages)
@@ -118,6 +256,16 @@ class SQLAgent:
             except Exception as exc:
                 raise RuntimeError(f"LLM 调用失败 (第{turn}轮): {exc}") from exc
 
+            # ---- Human-in-the-loop: detect ASK: prefix ----
+            ask_match = _extract_ask(content)
+            if ask_match:
+                yield {"type": "status", "msg": f"❓ AI 提问: {ask_match}"}
+                # Yield the question and WAIT for human answer via .send()
+                _human_answer = yield {"type": "ask", "text": ask_match}
+                # Record the assistant's question + human answer in history
+                messages.append({"role": "assistant", "content": content})
+                continue
+
             # Parse: does it contain SQL?
             sql = _extract_sql(content)
 
@@ -130,7 +278,7 @@ class SQLAgent:
                         "role": "user",
                         "content": f"SQL 校验失败: {reason}。请重新生成只读 SQL。",
                     })
-                    self._log(status_writer, f"⚠️ 校验失败: {reason}")
+                    yield {"type": "status", "msg": f"⚠️ 校验失败: {reason}"}
                     continue
 
                 # Preprocess: fix common LLM-generated syntax issues
@@ -138,7 +286,7 @@ class SQLAgent:
                 if fixed_sql != sql:
                     sql = fixed_sql
                     for note in fix_notes:
-                        self._log(status_writer, f"🔧 {note}")
+                        yield {"type": "status", "msg": f"🔧 {note}"}
 
                 # Execute (supports multiple ;-separated statements)
                 try:
@@ -156,14 +304,20 @@ class SQLAgent:
                             f"{result.head(10).to_markdown(index=False)}"
                         )
 
-                    self._log(
-                        status_writer,
-                        f"⚡ SQL 执行: {len(result)} 行 × {len(result.columns)} 列",
-                    )
+                    yield {
+                        "type": "status",
+                        "msg": f"⚡ SQL 执行: {len(result)} 行 × {len(result.columns)} 列",
+                    }
                     self._history.append({
                         "turn": turn, "sql": sql, "rows": len(result),
                         "exploratory": not content.strip().upper().startswith("FINAL:"),
                     })
+                    yield {
+                        "type": "sql",
+                        "sql": sql,
+                        "rows": len(result),
+                        "exploratory": not content.strip().upper().startswith("FINAL:"),
+                    }
                 except Exception as exc:
                     error_msg = str(exc)
                     messages.append({"role": "assistant", "content": content})
@@ -179,28 +333,86 @@ class SQLAgent:
                             f"5. 最终 SQL 必须返回人员编码、姓名、单位、培训名称、学时、主办单位、培训机构、开始/完成时间等明细字段"
                         ),
                     })
-                    self._log(status_writer, f"❌ 执行失败: {exc}")
+                    yield {"type": "status", "msg": f"❌ 执行失败: {exc}"}
                     continue
 
                 # Check if this is the FINAL response
                 content_upper = content.strip().upper()
-                is_final = (
-                    content_upper.startswith("FINAL:")
+                is_final = content_upper.startswith("FINAL:")
+
+                # ---- Mandatory exploration gate ----
+                # If user question contains fuzzy concepts, enforce exploration
+                # before accepting any FINAL SQL.
+                missing_exploration = _check_mandatory_exploration(
+                    question, self._history, sql
                 )
+                if is_final and missing_exploration:
+                    messages.append({"role": "assistant", "content": content})
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            f"⚠️ 强制探索要求：{missing_exploration}\n"
+                            f"用户问题中包含模糊业务概念，"
+                            f"在输出 FINAL SQL 之前，必须先通过 SELECT DISTINCT 查看数据库中的真实值。"
+                            f"请先生成探索性 SQL 查看真实数据，然后再输出 FINAL SQL。"
+                        ),
+                    })
+                    yield {
+                        "type": "status",
+                        "msg": f"🚫 强制探索: {missing_exploration}",
+                    }
+                    continue
+
+                # ---- Mandatory result column gate ----
+                # If this is FINAL, enforce detailed column requirements.
+                missing_cols = _check_final_columns(result, is_final)
+                if is_final and missing_cols:
+                    messages.append({"role": "assistant", "content": content})
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            f"⚠️ 最终结果字段不完整：{missing_cols}\n"
+                            f"最终 SQL 必须返回完整的明细信息以便人工审核，至少包含：\n"
+                            f"- 人员编码 (employee_code)\n"
+                            f"- 姓名 (name)\n"
+                            f"- 单位 (unit)\n"
+                            f"- 部门 (department)\n"
+                            f"- 干部标识 (cadre_flag)\n"
+                            f"- 培训名称 (course_name)\n"
+                            f"- 学时 (hours)\n"
+                            f"- 培训类型 (training_type)\n"
+                            f"- 主办单位 (organizer)\n"
+                            f"- 培训机构 (institution)\n"
+                            f"- 开始时间 (start_date)\n"
+                            f"- 完成时间 (end_date)\n"
+                            f"\n"
+                            f"当前结果只有 {len(result.columns)} 列：{', '.join(result.columns)}\n"
+                            f"请使用 JOIN 关联 persons 和 training_records 表，"
+                            f"在 SELECT 中显式列出上述所有字段，"
+                            f"然后重新输出 FINAL SQL。"
+                        ),
+                    })
+                    yield {
+                        "type": "status",
+                        "msg": f"🚫 字段不完整: {missing_cols}",
+                    }
+                    continue
 
                 if is_final or turn == MAX_AGENT_TURNS:
-                    self._log(status_writer, "✅ Agent 完成，已生成最终 SQL")
+                    yield {"type": "status", "msg": "✅ Agent 完成，已生成最终 SQL"}
                     # Get explanation
                     explanation = self._get_explanation(
                         llm_client, question, result_summary
                     )
-                    return {
+                    yield {
+                        "type": "result",
                         "sql": sql,
                         "result": result,
                         "explanation": explanation,
                         "turns": turn,
                         "history": self._history,
                     }
+                    return
 
                 # Not final — feed result back for further exploration
                 messages.append({"role": "assistant", "content": content})
@@ -220,27 +432,77 @@ class SQLAgent:
                 })
 
         # Max turns reached — return last result if any
-        self._log(status_writer, "⚠️ 达到最大轮次，返回最后一次结果")
+        yield {"type": "status", "msg": "⚠️ 达到最大轮次，返回最后一次结果"}
         if self._history:
             last = self._history[-1]
             last_sql = last["sql"]
             last_result = db.query_to_df(last_sql)
             last_summary = f"结果: {len(last_result)} 行 x {len(last_result.columns)} 列"
             explanation = self._get_explanation(llm_client, question, last_summary)
-            return {
+            yield {
+                "type": "result",
                 "sql": last_sql,
                 "result": last_result,
                 "explanation": explanation,
                 "turns": MAX_AGENT_TURNS,
                 "history": self._history,
             }
-        return {
+            return
+        yield {
+            "type": "result",
             "sql": "",
             "result": pd.DataFrame({"提示": ["Agent 未能在最大轮次内完成分析"]}),
             "explanation": "分析超时，请尝试更具体的问题。",
             "turns": MAX_AGENT_TURNS,
             "history": self._history,
         }
+
+    def run(
+        self,
+        question: str,
+        llm_client,  # LLMClient instance
+        db: TrainingDatabase,
+        status_writer=None,  # optional st.status() for Streamlit progress
+    ) -> dict:
+        """Run the full agent loop (backward-compatible, blocking).
+
+        Args:
+            question: User's natural language question.
+            llm_client: Configured LLMClient instance.
+            db: Connected TrainingDatabase instance.
+            status_writer: Optional callback for progress messages.
+
+        Returns:
+            dict with keys: sql (final SQL), result (DataFrame),
+            explanation (str), turns (int), history (list).
+        """
+        gen = self.run_iter(
+            question=question,
+            llm_client=llm_client,
+            db=db,
+            status_writer=status_writer,
+        )
+        result = None
+        try:
+            while True:
+                event = next(gen)
+                if event["type"] == "ask":
+                    # In blocking mode, auto-reply telling the AI to continue on its own
+                    event = gen.send("请继续基于现有信息进行分析，不需要额外人工输入。")
+                elif event["type"] == "result":
+                    result = event
+                    break
+        except StopIteration:
+            pass
+        if result is None:
+            return {
+                "sql": "",
+                "result": pd.DataFrame({"提示": ["Agent 未能在最大轮次内完成分析"]}),
+                "explanation": "分析超时，请尝试更具体的问题。",
+                "turns": MAX_AGENT_TURNS,
+                "history": self._history,
+            }
+        return result
 
     def _get_schema(self) -> str:
         """Build a compact database schema for the LLM."""
@@ -428,6 +690,21 @@ def _extract_sql(text: str) -> str:
     return text.rstrip(";")
 
 
+
+
+def _extract_ask(text: str) -> str:
+    """Extract human question from LLM response if it starts with ASK:.
+
+    Returns the question text, or empty string if no ASK: prefix found.
+    """
+    text = text.strip()
+    upper = text.upper()
+    # Match ASK: at the very beginning, or after a newline
+    for prefix in ["ASK:", "问：", "提问:", "QUESTION:", "问题："]:
+        idx = upper.find(prefix)
+        if idx == 0 or (idx > 0 and text[idx - 1] == "\n"):
+            return text[idx + len(prefix):].strip().split("\n")[0].strip()
+    return ""
 
 
 def _split_statements(sql: str) -> list[str]:
