@@ -13,10 +13,9 @@ Version: 1.0
 -   上传 Excel（后续支持 CSV、Parquet、SQLite 等）
 -   在本地通过SQLite数据库保存中间数据
 -   使用自然语言进行数据分析
--   LLM 负责理解需求并生成 Pandas 分析代码
+-   LLM 负责理解需求并生成  SQL 分析代码
 -   Python 本地执行分析代码
 -   Streamlit 展示结果
--   AI 对分析结果进行解释
 -   支持 OpenAI Compatible API（OpenAI、Qwen、GLM、DeepSeek、vLLM 等）
 
 ------------------------------------------------------------------------
@@ -77,13 +76,12 @@ Version: 1.0
 负责：
 
 -   理解自然语言
--   理解 DataFrame Schema
+-   理解数据库Schema
 -   生成 Python 分析代码
 -   对分析结果进行解释
 
 禁止：
 
--   自行计算统计值
 -   保存完整数据
 -   网络访问
 -   文件读写
@@ -96,7 +94,6 @@ Version: 1.0
 -   Excel读取
 -   数据清洗
 -   SQLite操作
--   Pandas分析
 -   图表生成
 -   导出Excel/PDF
 -   所有数学计算
@@ -106,14 +103,71 @@ Version: 1.0
 ## 五、数据流
 
 1.  用户上传 Excel。
-2.  使用 pandas 读取 DataFrame。
-3.  构建 SQLite数据库。
-4.  Prompt Builder 将 Profile + 用户问题发送给 LLM。
-5.  LLM 返回 Python 代码。
-6.  Safe Executor 在受限环境执行代码操作SQLite数据库进行数据分析。
-7.  将结果交给 Streamlit 展示。
-8.  将结果摘要发送给 LLM 生成解释。
+2.  构建 SQLite数据库。
+3.  Prompt Builder 将 Profile + 用户问题发送给 LLM。
+4.  LLM 探索数据库，根据自身理解生成 Python 代码。
+5.  Safe Executor 在受限环境执行代码操作SQLite数据库进行数据分析。
+6.  将结果交给 Streamlit 展示。
 
+例如，用户输入：
+统计集团班子成员近三年的培训情况
+
+不要直接要求：
+请生成 SQL。
+
+而是给模型一个工具：
+run_sql(sql: str) -> DataFrame
+
+并告诉它：
+你可以多次调用 run_sql()，先了解数据库，再完成最终查询。
+
+AI第一步：查看数据库结构
+PRAGMA table_info(employee);
+得到：
+employee_id
+name
+department
+position
+...
+
+AI第二步：看看职位有哪些
+SELECT DISTINCT position
+FROM employee
+ORDER BY position;
+返回：
+董事长
+总经理
+副总经理
+部长
+副部长
+工程师
+高级工程师
+……
+AI此时已经知道企业到底有哪些职位，而不是凭空猜。
+
+AI第三步：思考
+AI在内部推理：
+"班子成员"一般应包括：
+董事长
+总经理
+副总经理
+数据库里没有"党委书记"这个职位，因此不应加入。
+
+AI第四步：生成最终的检索SQL
+SELECT
+    e.name,
+    SUM(t.hours)
+FROM employee e
+JOIN training t
+ON e.employee_id=t.employee_id
+WHERE e.position IN (
+'董事长',
+'总经理',
+'副总经理'
+)
+AND t.date>='2023-01-01'
+GROUP BY e.employee_id;
+执行并反馈用户真正的检索结果
 ------------------------------------------------------------------------
 
 ## 六、Prompt 设计原则
@@ -122,10 +176,8 @@ Prompt 中仅包含：
 
 -   Schema
 -   字段信息
--   少量样例
+-   SQL样例
 -   用户问题
-
-禁止发送整个 DataFrame。
 
 ------------------------------------------------------------------------
 
@@ -181,29 +233,13 @@ Prompt 中仅包含：
 ## 九、UI 原则
 
 -   UI 与业务逻辑完全分离。
--   页面不展示 AI 生成代码（调试模式除外）。
--   图表优先使用 Plotly。
 -   所有错误均给出可读提示。
 
 ------------------------------------------------------------------------
 
-## 十、未来规划
+## 十、开发原则
 
--   多文件分析
--   多 Sheet 联动
--   DuckDB
--   SQLite
--   RAG
--   MCP 工具
--   SQL Agent
--   知识库
--   插件机制
-
-------------------------------------------------------------------------
-
-## 十一、开发原则
-
-1.  DataFrame 是唯一数据源。
+1.  SQLite 是唯一数据源。
 2.  Prompt 尽量短。
 3.  Python 负责所有计算。
 4.  LLM 不直接处理全量数据。

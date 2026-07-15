@@ -1,4 +1,4 @@
-# HRData 重构方案：SQLite + LLM SQL Agent
+# HRData SQL AGENT：SQLite + LLM SQL Agent
 
 ## 目标
 

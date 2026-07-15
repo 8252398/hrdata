@@ -10,7 +10,7 @@ app_hr 是一个基于 **Streamlit + Pandas + OpenAI Compatible API**
 设计目标：
 
 -   本地运行、支持私有部署
--   使用自然语言分析 Excel 数据
+-   使用自然语言分析数据
 -   Python 负责所有计算
 -   LLM 负责理解需求、生成分析代码和解释结果
 -   模块化、可维护、可扩展
@@ -57,19 +57,15 @@ app_hr 是一个基于 **Streamlit + Pandas + OpenAI Compatible API**
 
 ------------------------------------------------------------------------
 
-## 3. ROADMAP.md
+## 3. SQL_AGENT.md
 
-定义项目长期开发路线图。
+定义llm通过探索的方式分析数据的模式。
 
 主要内容：
 
--   各阶段目标
--   Milestone 划分
--   功能规划
--   验收标准
--   发布计划
-
-建议一次开发一个 Milestone，不跨阶段实现功能。
+-  llm在收到用户要求后的处理流程
+-  llm在执行分析时应遵循的原则
+-  具体的示例
 
 ------------------------------------------------------------------------
 
@@ -80,7 +76,7 @@ app_hr 是一个基于 **Streamlit + Pandas + OpenAI Compatible API**
 主要内容：
 
 -   System Prompt
--   DataFrame Profile Prompt
+-   SQL Prompt
 -   Code Generation Prompt
 -   Result Explanation Prompt
 -   Chart Prompt
@@ -96,53 +92,8 @@ app_hr 是一个基于 **Streamlit + Pandas + OpenAI Compatible API**
 
 1.  阅读 ARCHITECTURE.md，理解系统设计。
 2.  阅读 CODING_RULES.md，遵循编码规范。
-3.  根据 ROADMAP.md 选择当前 Milestone。
+3.  阅读 SQL_AGENT.md，遵循agent设计原则。
 4.  按 PROMPT_RULES.md 设计或修改 Prompt。
 5.  开发、测试并更新相关文档。
 
-------------------------------------------------------------------------
 
-# 核心设计理念
-
--   DataFrame 是唯一数据源。
--   LLM 不保存完整数据。
--   Python 负责全部计算。
--   Prompt 保持精简。
--   所有 AI 生成代码必须经过安全校验。
--   UI 与业务逻辑分离。
--   支持 OpenAI Compatible API。
-
-------------------------------------------------------------------------
-
-# 推荐目录结构
-
-``` text
-app_hr/
-├── README.md
-├── ARCHITECTURE.md
-├── CODING_RULES.md
-├── ROADMAP.md
-├── PROMPT_RULES.md
-├── requirements.txt
-├── app_hr.py
-├── modules/
-├── utils/
-├── config/
-├── templates/
-├── fonts/
-└── tests/
-```
-
-------------------------------------------------------------------------
-
-# 后续建议
-
-随着项目发展，可增加：
-
--   MODULE_SPEC.md（模块接口规范）
--   DATAFLOW.md（数据流说明）
--   SECURITY.md（安全设计）
--   DEPLOYMENT.md（部署说明）
--   CHANGELOG.md（版本变更记录）
-
-以上文档共同构成项目的长期知识库，为人工开发和 AI 协同开发提供统一依据。
