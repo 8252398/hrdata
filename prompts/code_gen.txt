@@ -1,4 +1,4 @@
-﻿## 数据库 Schema
+## 数据库 Schema
 {schema}
 
 ## 用户问题

@@ -43,6 +43,58 @@ class LLMClient:
             "LLM client created: provider=%s, model=%s", self.provider, self.model
         )
 
+    def chat_messages(
+        self,
+        messages: list[dict],
+        temperature: float = 0.1,
+        max_tokens: int = 4096,
+        timeout: int = 180,
+        extra_body: dict | None = None,
+    ) -> str:
+        """Send a chat completion request with a raw message list.
+
+        Args:
+            messages: OpenAI-compatible message list.
+            temperature: Sampling temperature.
+            max_tokens: Max output tokens.
+            timeout: Request timeout in seconds.
+            extra_body: Optional extra body for provider-specific features.
+                        If None, deepseek provider defaults to enabling thinking.
+
+        Returns:
+            Model response text.
+
+        Raises:
+            RuntimeError: If API call fails.
+        """
+        prompt_len = sum(len(m.get("content", "")) for m in messages)
+        logger.info(
+            "Chat messages request: model=%s, messages=%d, prompt_len=%d, timeout=%d",
+            self.model, len(messages), prompt_len, timeout,
+        )
+
+        body = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+            "timeout": timeout,
+        }
+        if extra_body is not None:
+            body["extra_body"] = extra_body
+        elif self.provider == "deepseek":
+            # deepseek-v4-pro / deepseek-reasoner support explicit thinking mode
+            body["extra_body"] = {"thinking": {"type": "enabled"}}
+
+        try:
+            response = self._client.chat.completions.create(**body)
+            content = response.choices[0].message.content or ""
+            logger.info("Chat response: %d chars", len(content))
+            return content
+        except Exception as exc:
+            logger.exception("LLM API call failed")
+            raise RuntimeError(f"AI 调用失败: {exc}") from exc
+
     def chat(
         self,
         user_message: str,
@@ -51,7 +103,7 @@ class LLMClient:
         max_tokens: int = 4096,
         timeout: int = 180,
     ) -> str:
-        """Send a chat completion request.
+        """Send a single-turn chat completion request.
 
         Args:
             user_message: User prompt content.
@@ -62,38 +114,19 @@ class LLMClient:
 
         Returns:
             Model response text.
-
-        Raises:
-            RuntimeError: If API call fails.
         """
-        messages = []
         if system_message:
             # deepseek-reasoner does not support system role; prepend to user
-            messages.append({
+            messages = [{
                 "role": "user",
                 "content": f"[System Instructions]\n{system_message}\n\n{user_message}",
-            })
+            }]
         else:
-            messages.append({"role": "user", "content": user_message})
+            messages = [{"role": "user", "content": user_message}]
 
-        prompt_len = len(user_message) + len(system_message)
-        logger.info(
-            "Chat request: model=%s, prompt_len=%d, timeout=%d",
-            self.model, prompt_len, timeout,
+        return self.chat_messages(
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            timeout=timeout,
         )
-
-        try:
-            response = self._client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                timeout=timeout,
-                extra_body={"thinking": {"type": "enabled"}},
-            )
-            content = response.choices[0].message.content or ""
-            logger.info("Chat response: %d chars", len(content))
-            return content
-        except Exception as exc:
-            logger.exception("LLM API call failed")
-            raise RuntimeError(f"AI 调用失败: {exc}") from exc

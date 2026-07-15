@@ -59,6 +59,19 @@ def _resolve_column(df: pd.DataFrame, aliases: list[str]) -> Optional[str]:
     return None
 
 
+def _normalize_date_series(series: pd.Series) -> pd.Series:
+    """Normalize a date-like series to ISO 'YYYY-MM-DD' strings.
+
+    Returns the original string representation for values that cannot be
+    parsed, so callers can report invalid dates separately.
+    """
+    parsed = pd.to_datetime(series, errors="coerce", format="mixed")
+    normalized = parsed.dt.strftime("%Y-%m-%d")
+    # Preserve original values where parsing failed
+    normalized[parsed.isna() & series.notna()] = series[parsed.isna() & series.notna()].astype(str)
+    return normalized
+
+
 @dataclass
 class ImportReport:
     """Report after database build/supplement."""
@@ -182,9 +195,37 @@ class TrainingDatabase:
         df[col_code] = df[col_code].astype(str).str.strip()
         df = df[df[col_code] != ""].dropna(subset=[col_code])
 
-        # Count unique persons (each person has many course rows — this is expected)
-        unique_codes = df[col_code].nunique()
-        report.duplicate_codes = 0  # Duplicate rows per person are normal in training records
+        # Detect duplicate employee codes in the personnel dimension.
+        # Multiple training rows per person are expected, but the same code
+        # should map to a single person profile.
+        code_counts = df[col_code].value_counts()
+        duplicated_codes = code_counts[code_counts > 1].index.tolist()
+        report.duplicate_codes = len(duplicated_codes)
+        if duplicated_codes:
+            sample = duplicated_codes[:10]
+            report.errors.append(
+                f"培训学时记录中存在 {len(duplicated_codes)} 个重复集团员工编码（按人员维度）"
+                f"，示例：{', '.join(sample)}"
+            )
+
+        # Normalize date columns to YYYY-MM-DD and report invalid dates
+        date_cols = {
+            "开始学习时间": field_cols.get("开始学习时间"),
+            "完成学习时间": field_cols.get("完成学习时间"),
+        }
+        for label, col in date_cols.items():
+            if col:
+                original = df[col].copy()
+                df[col] = _normalize_date_series(df[col])
+                invalid_mask = (
+                    original.notna()
+                    & (original.astype(str).str.strip() != "")
+                    & df[col].str.match(r"\d{4}-\d{2}-\d{2}", na=False).eq(False)
+                )
+                if invalid_mask.any():
+                    report.errors.append(
+                        f"{label} 列存在 {int(invalid_mask.sum())} 行无法解析的日期"
+                    )
 
         # Build person records
         persons_inserted = set()
@@ -268,6 +309,19 @@ class TrainingDatabase:
         df = person_df.copy()
         df[col_code] = df[col_code].astype(str).str.strip()
         df = df[df[col_code] != ""].dropna(subset=[col_code])
+
+        # Detect duplicate employee codes in cadre info table
+        code_counts = df[col_code].value_counts()
+        duplicated_codes = code_counts[code_counts > 1].index.tolist()
+        if duplicated_codes:
+            sample = duplicated_codes[:10]
+            report.duplicate_codes = len(duplicated_codes)
+            report.errors.append(
+                f"干部人员信息表中存在 {len(duplicated_codes)} 个重复集团员工编码"
+                f"，将使用第一条记录补充干部标识，示例：{', '.join(sample)}"
+            )
+            # Deduplicate: keep the first occurrence for cadre_flag supplementation
+            df = df.drop_duplicates(subset=[col_code], keep="first")
 
         # Get existing codes from DB
         existing = set(

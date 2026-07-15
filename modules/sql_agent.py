@@ -7,11 +7,11 @@ Python only executes read-only SQL; all business reasoning is in the LLM.
 from __future__ import annotations
 
 import re
-import pathlib
 from typing import Optional
 
 import pandas as pd
 
+from modules.prompt_builder import PromptBuilder
 from modules.sqlite_manager import TrainingDatabase
 from utils.logger import get_logger
 
@@ -83,35 +83,38 @@ class SQLAgent:
         self._db = db
         self._history = []
 
-        # Step 0: Get schema
+        # Step 0: Get schema and build prompt
         schema_text = self._get_schema()
         self._log(status_writer, "🔍 Agent 启动，探索数据库中...")
 
-        # Build conversation context
+        prompt_builder = PromptBuilder()
+        system_prompt, initial_user = prompt_builder.build_sql_prompt(
+            schema_text=schema_text,
+            question=question,
+        )
+
         # deepseek-reasoner does not support system role; prepend to first user message
         messages = [
             {
                 "role": "user",
-                "content": (
-                    f"[System Instructions]\n{_SYSTEM_PROMPT}\n\n"
-                    f"## 数据库 Schema\n{schema_text}\n\n## 用户问题\n{question}"
-                ),
+                "content": f"[System Instructions]\n{system_prompt}\n\n{initial_user}",
             },
         ]
 
         for turn in range(1, MAX_AGENT_TURNS + 1):
             self._log(status_writer, f"🔄 第 {turn} 轮对话...")
 
+            # Trim conversation if it grows too long
+            messages = self._trim_messages(messages)
+
             # Call LLM
             try:
-                response = llm_client._client.chat.completions.create(
-                    model=llm_client.model,
+                content = llm_client.chat_messages(
                     messages=messages,
                     temperature=0.1,
                     max_tokens=4096,
                     timeout=180,
                 )
-                content = response.choices[0].message.content or ""
             except Exception as exc:
                 raise RuntimeError(f"LLM 调用失败 (第{turn}轮): {exc}") from exc
 
@@ -130,13 +133,14 @@ class SQLAgent:
                     self._log(status_writer, f"⚠️ 校验失败: {reason}")
                     continue
 
-                # Execute (supports multiple ;-separated statements)
-                # Auto-fix common CTE syntax errors before execution
-                fixed_sql, fix_note = _auto_fix_cte(sql)
-                if fix_note:
-                    self._log(status_writer, f"🔧 {fix_note.strip()}")
-                    sql = fixed_sql  # Use the auto-fixed version
+                # Preprocess: fix common LLM-generated syntax issues
+                fixed_sql, fix_notes = _preprocess_sql(sql)
+                if fixed_sql != sql:
+                    sql = fixed_sql
+                    for note in fix_notes:
+                        self._log(status_writer, f"🔧 {note}")
 
+                # Execute (supports multiple ;-separated statements)
                 try:
                     result, batch_summary = _execute_batch(db, sql)
                     result_summary = (
@@ -161,10 +165,19 @@ class SQLAgent:
                         "exploratory": not content.strip().upper().startswith("FINAL:"),
                     })
                 except Exception as exc:
+                    error_msg = str(exc)
                     messages.append({"role": "assistant", "content": content})
                     messages.append({
                         "role": "user",
-                        "content": f"SQL 执行失败: {exc}\n请修正 SQL 并重试。",
+                        "content": (
+                            f"SQL 执行失败: {error_msg}\n"
+                            f"请修正 SQL 并重试。常见错误检查清单：\n"
+                            f"1. 如果使用 CTE，必须以 WITH 开头，例如：WITH cte1 AS (SELECT ...), cte2 AS (...) SELECT ...\n"
+                            f"2. 比较运算符必须使用 <= 和 >=，不要使用 Unicode 符号 ≤ 或 ≥\n"
+                            f"3. 字符串值必须用单引号包裹\n"
+                            f"4. cadre_flag 字段中可能包含用 '|' 连接的多个身份标签，不要将其拆分，应作为完整字符串匹配\n"
+                            f"5. 最终 SQL 必须返回人员编码、姓名、单位、培训名称、学时、主办单位、培训机构、开始/完成时间等明细字段"
+                        ),
                     })
                     self._log(status_writer, f"❌ 执行失败: {exc}")
                     continue
@@ -234,17 +247,41 @@ class SQLAgent:
         if self._db is None:
             return "Database not connected"
 
+        # Column descriptions for the LLM
+        _COLUMN_DESC = {
+            "employee_code": "集团员工编码（人员唯一标识）",
+            "name": "姓名",
+            "phone": "商网手机号",
+            "unit": "单位名称",
+            "department": "部门名称",
+            "cadre_flag": "干部标识",
+            "id": "培训记录自增ID",
+            "course_name": "培训/课程名称（来源信息）",
+            "hours": "学时",
+            "study_type": "学习类型",
+            "training_type": "培训类型",
+            "training_method": "培训方式",
+            "organizer": "主办单位",
+            "institution": "培训机构",
+            "start_date": "开始学习时间",
+            "end_date": "完成学习时间",
+        }
+
         # Get schema via PRAGMA
         persons_schema = self._db.query_to_df("PRAGMA table_info(persons)")
         training_schema = self._db.query_to_df("PRAGMA table_info(training_records)")
 
         lines = ["## persons 表"]
         for _, row in persons_schema.iterrows():
-            lines.append(f"- {row['name']} ({row['type']})")
+            col = row["name"]
+            desc = _COLUMN_DESC.get(col, "")
+            lines.append(f"- {col} ({row['type']}){f' — {desc}' if desc else ''}")
         lines.append("")
         lines.append("## training_records 表")
         for _, row in training_schema.iterrows():
-            lines.append(f"- {row['name']} ({row['type']})")
+            col = row["name"]
+            desc = _COLUMN_DESC.get(col, "")
+            lines.append(f"- {col} ({row['type']}){f' — {desc}' if desc else ''}")
         lines.append("")
         lines.append("两表通过 employee_code 关联。")
 
@@ -256,14 +293,72 @@ class SQLAgent:
 
     def _get_explanation(self, llm_client, question: str, summary: str) -> str:
         """Ask LLM to explain the final result."""
-        prompt = f"## 用户问题\n{question}\n\n## 分析结果\n{summary}\n\n请用自然语言总结（2-4句话中文）。不编造数据。"
+        prompt_builder = PromptBuilder()
+        system, user = prompt_builder.build_explanation_prompt(
+            question=question,
+            summary=summary,
+        )
         try:
             return llm_client.chat(
-                user_message=prompt,
-                system_message="你是一位数据分析师。请简洁解释分析结果。",
+                user_message=user,
+                system_message=system,
             )
         except Exception:
+            logger.exception("Failed to generate explanation")
             return "AI 解释生成失败"
+
+    def _trim_messages(
+        self,
+        messages: list[dict],
+        max_tokens: int = 6000,
+        keep_recent: int = 4,
+    ) -> list[dict]:
+        """Trim conversation history to avoid token overflow.
+
+        Strategy:
+        - Always keep the first message (system instructions + schema + question).
+        - If total estimated tokens exceed max_tokens, drop oldest assistant/user
+          pairs while keeping the most recent `keep_recent` pairs.
+        """
+        if len(messages) <= 2:
+            return messages
+
+        # Estimate tokens: Chinese-heavy text -> ~3 chars/token, English -> ~4 chars/token.
+        # Use a conservative mixed estimate of 3.5 chars per token.
+        def _estimate_tokens(msg_list: list[dict]) -> int:
+            total_chars = sum(len(m.get("content", "")) for m in msg_list)
+            return int(total_chars / 3.5)
+
+        if _estimate_tokens(messages) <= max_tokens:
+            return messages
+
+        # Keep first message, then trim from the middle.
+        first = [messages[0]]
+        rest = messages[1:]
+
+        # Each exploration "turn" contributes an assistant + user pair.
+        # Keep the most recent pairs, drop older ones.
+        pairs = []
+        i = 0
+        while i + 1 < len(rest):
+            pairs.append((rest[i], rest[i + 1]))
+            i += 2
+
+        kept_pairs = pairs[-keep_recent:] if len(pairs) > keep_recent else pairs
+        trimmed = first + [msg for pair in kept_pairs for msg in pair]
+
+        # Add a reminder that earlier context was summarized away
+        if len(pairs) > keep_recent:
+            trimmed.append({
+                "role": "user",
+                "content": "（前面几轮的探索结果已省略，请基于最近的探索和数据库 Schema 继续分析。）",
+            })
+
+        logger.warning(
+            "Agent conversation trimmed: %d -> %d messages, est_tokens=%d",
+            len(messages), len(trimmed), _estimate_tokens(trimmed),
+        )
+        return trimmed
 
     def _log(self, writer, msg: str) -> None:
         """Write progress to Streamlit status or logger."""
@@ -341,6 +436,63 @@ def _split_statements(sql: str) -> list[str]:
     return [p.strip() for p in parts if p.strip()]
 
 
+def _preprocess_sql(sql: str) -> tuple[str, list[str]]:
+    """Fix common syntax issues in LLM-generated SQL before execution.
+
+    Returns:
+        (fixed_sql, list_of_fix_descriptions).
+    """
+    notes: list[str] = []
+    fixed = sql
+
+    # Replace Unicode comparison operators with ASCII equivalents
+    if "≤" in fixed or "≥" in fixed:
+        fixed = fixed.replace("≤", "<=").replace("≥", ">=")
+        notes.append("将 Unicode 比较运算符 ≤/≥ 替换为 <=/>=")
+
+    # Fix missing WITH before CTE definitions.
+    # Pattern: "SELECT ... ) , cte_name AS ( ..." means the first SELECT
+    # should have been wrapped in a CTE with a WITH prefix.
+    stripped = fixed.strip()
+    upper = stripped.upper()
+    if not upper.startswith("WITH") and not upper.startswith("PRAGMA"):
+        # Detect orphaned CTE pattern: ) , name AS (
+        m = re.search(r"\)\s*,\s*(\w+)\s+AS\s*\(", stripped, re.IGNORECASE)
+        if m:
+            closing_paren_pos = m.start()  # position of the first ')'
+            # Find the start of the first SELECT
+            select_start = upper.find("SELECT")
+            if select_start != -1 and select_start < closing_paren_pos:
+                first_query = stripped[select_start:closing_paren_pos].strip().rstrip(";")
+                # The rest starts after the first ')'
+                rest = stripped[closing_paren_pos + 1:].lstrip(",").strip()
+
+                # Try to infer the intended name for the first CTE.
+                # Look at the final SELECT's FROM/JOIN aliases; if one alias
+                # is not defined as a CTE later, it's likely the first CTE name.
+                defined_ctes = {c.lower() for c in re.findall(r"(\w+)\s+AS\s*\(", rest, re.IGNORECASE)}
+                final_aliases = set(re.findall(r"\bFROM\s+(\w+)|\bJOIN\s+(\w+)", upper[closing_paren_pos:]))
+                # flatten tuples from the regex above
+                final_aliases = {a for tup in final_aliases for a in tup if a}
+                inferred_name = None
+                for alias in final_aliases:
+                    if alias.upper() not in {"PERSONS", "TRAINING_RECORDS"} and alias.lower() not in defined_ctes:
+                        inferred_name = alias
+                        break
+
+                if inferred_name:
+                    first_cte_name = inferred_name
+                else:
+                    # Fallback: use the first CTE name found in the rest
+                    name_match = re.match(r"^(\w+)\s+AS\s*\(", rest, re.IGNORECASE)
+                    first_cte_name = name_match.group(1) if name_match else "auto_cte_0"
+
+                fixed = f"WITH {first_cte_name} AS (\n  {first_query}\n), {rest}"
+                notes.append(f'为首个 CTE 自动补全 WITH 关键字，命名为 "{first_cte_name}"')
+
+    return fixed, notes
+
+
 def _execute_batch(db, sql: str):
     """Execute potentially multi-statement SQL.
     
@@ -376,52 +528,3 @@ def _execute_batch(db, sql: str):
     )
 
 
-def _auto_fix_cte(sql: str) -> str:
-    """Auto-repair SQL: prepend WITH if CTE definitions are orphaned.
-
-    Pattern detected: SELECT ... ) , cte_name AS ( ...  (missing WITH keyword).
-    Wraps the orphaned SELECT into a CTE and adds WITH prefix.
-    """
-    import re
-    stripped = sql.strip()
-    upper = stripped.upper()
-
-    # Already has WITH — nothing to fix
-    if upper.startswith("WITH"):
-        return sql, ""
-
-    # Detect orphaned CTE pattern: ) , name AS (
-    m = re.search(r"\)\s*,\s*(\w+)\s+AS\s*\(", stripped, re.IGNORECASE)
-    if not m:
-        return sql, ""
-
-    # Find the first SELECT before the orphaned CTE
-    first_cte_name = m.group(1)
-    closing_paren_pos = m.start()  # position of the )
-
-    # Find the start of the first SELECT
-    before_paren = stripped[:closing_paren_pos]
-    select_start = upper.find("SELECT")
-    if select_start == -1:
-        return sql, ""  # can't determine the first query
-
-    # Build the auto-fixed SQL
-    first_query = stripped[select_start:closing_paren_pos].strip().rstrip(";")
-    auto_cte_name = "auto_cte_0"
-    rest = stripped[closing_paren_pos + 1:].lstrip(",").strip()
-
-    fixed = f"WITH {auto_cte_name} AS (\n  {first_query}\n), {rest}"
-    note = (
-        f"[Auto-fix] Detected missing WITH before CTE. "
-        f"Wrapped orphaned SELECT into CTE \"{auto_cte_name}\". "
-        f"Original first CTE was \"{first_cte_name}\".\n"
-    )
-    return fixed, note
-
-
-# ═══════════════════════════════════════════════════════════
-# System Prompt
-# ═══════════════════════════════════════════════════════════
-
-_AGENT_PROMPT_FILE = pathlib.Path(__file__).resolve().parent.parent / "prompts" / "agent_system.txt"
-_SYSTEM_PROMPT = _AGENT_PROMPT_FILE.read_text('utf-8')

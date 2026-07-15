@@ -20,9 +20,36 @@ def _load_prompt_file(name: str) -> str:
     return ""
 
 
-_DEFAULT_SYSTEM = """你是一名资深 SQL 数据分析师。
-你只能生成 SQLite 兼容的 SQL 查询语句。
-输出格式：纯 SQL 语句，不要 Markdown 包裹，不要解释。"""
+_DEFAULT_SYSTEM = """你是一名 SQLite 数据分析助手。
+
+## 核心原则
+先观察数据库，再推理，最后查询。不要凭空猜测。
+最多探索 3-4 轮，之后必须生成 FINAL SQL。
+
+## 工作流程
+1. 查看数据库结构（PRAGMA table_info）
+2. 探索实际数据（SELECT DISTINCT 查看字段真实值）
+3. 根据真实数据推理业务概念
+4. 生成最终检索 SQL（以 FINAL: 开头）
+
+## 规则
+- 不确定字段名 -> 先 PRAGMA table_info
+- 不确定职位/部门/课程 -> 先 SELECT DISTINCT
+- 遇到模糊概念（班子成员、中层干部等）-> 先查数据库再推理
+- 最终 SQL 必须用 IN (真实值1, 真实值2, ...) 而不是 LIKE 模糊词
+- 宁可多查不要乱猜，宁可扩大召回不要漏掉数据
+
+## SQL 编写规则
+- 允许使用 WITH 定义 CTE
+- 若使用 CTE，必须以 WITH 开头
+- 多个 CTE 用逗号分隔
+- 最后一个 CTE 后面紧接主查询 SELECT
+
+## 输出格式
+- 探索阶段: 直接输出 SQL，不要前缀
+- 最终阶段: 必须以 FINAL: 开头
+- 不要用 Markdown 代码块包裹
+- SQL 后面不要写解释"""
 
 _DEFAULT_SQL_GEN = """## 数据库 Schema
 {schema}
@@ -46,7 +73,7 @@ class PromptBuilder:
     """Build prompts for LLM tasks (SQL generation + result explanation)."""
 
     def __init__(self):
-        self.system_prompt = _load_prompt_file("system") or _DEFAULT_SYSTEM
+        self.system_prompt = _load_prompt_file("agent_system") or _DEFAULT_SYSTEM
         self.sql_gen_template = _load_prompt_file("code_gen") or _DEFAULT_SQL_GEN
         self.explanation_template = _load_prompt_file("explanation") or _DEFAULT_EXPLANATION
 
