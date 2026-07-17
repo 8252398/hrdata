@@ -17,6 +17,10 @@ FONTS_DIR = ROOT / "fonts"
 PROMPTS_DIR = ROOT / "prompts"
 DB_PATH = DATA_DIR / "training.db"
 
+# ---- Agent turn limits ----
+MAX_AGENT_TURNS_DEFAULT = 8
+MAX_AGENT_TURNS_EXTEND = 8
+
 
 # ---- LLM defaults (override via env or UI) ----
 @dataclass
