@@ -11,29 +11,14 @@ from typing import Optional
 
 import pandas as pd
 
+from config.settings import MAX_AGENT_TURNS_DEFAULT, MAX_AGENT_TURNS_EXTEND
 from modules.prompt_builder import PromptBuilder
 from modules.sqlite_manager import TrainingDatabase
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-MAX_AGENT_TURNS = 8  # prevent infinite loops
-
-# Fuzzy business concepts that MUST be explored via SELECT DISTINCT before FINAL
-_FUZZY_CONCEPTS = [
-    "班子成员", "中层干部", "技术人员", "年轻干部", "管理人员",
-    "领导干部", "集团领导", "核心人员", "关键岗位", "骨干",
-    "干部", "领导", "班子", "管理层", "高管",
-]
-
-# Fields that should be explored when fuzzy concepts appear
-_EXPLORATION_FIELDS = {
-    "cadre_flag": ("persons", "干部标识/身份标签"),
-    "organizer": ("training_records", "主办单位/培训机构"),
-    "training_type": ("training_records", "培训类型"),
-    "department": ("persons", "部门名称"),
-    "unit": ("persons", "单位名称"),
-}
+MAX_AGENT_TURNS = MAX_AGENT_TURNS_DEFAULT  # prevent infinite loops
 
 # Required columns for FINAL SQL result (must have detailed fields for human audit)
 _REQUIRED_COLUMNS = {
@@ -59,66 +44,6 @@ _FORBIDDEN_KEYWORDS = [
     "INSERT", "UPDATE", "DELETE", "DROP", "ALTER",
     "CREATE", "ATTACH", "DETACH", "REPLACE",
 ]
-
-
-def _check_mandatory_exploration(
-    question: str,
-    history: list[dict],
-    current_sql: str,
-) -> str:
-    """Check whether required exploration has been performed before FINAL.
-
-    Returns:
-        Empty string if exploration is sufficient, otherwise a message
-        describing what exploration is still required.
-    """
-    upper_q = question.upper()
-
-    # Detect which fuzzy concepts appear in the question
-    matched_concepts = [c for c in _FUZZY_CONCEPTS if c in question]
-    if not matched_concepts:
-        return ""  # no fuzzy concepts, no mandatory exploration
-
-    # Check what DISTINCT explorations have already been executed
-    explored_fields = set()
-    for h in history:
-        if not h.get("exploratory", False):
-            continue
-        sql_upper = h.get("sql", "").upper()
-        for field in _EXPLORATION_FIELDS:
-            if f"DISTINCT {field.upper()}" in sql_upper:
-                explored_fields.add(field)
-
-    # Determine which fields need exploration based on matched concepts
-    required_fields = set()
-    # cadre_flag / 干部相关
-    if any(c in question for c in ["班子成员", "中层干部", "干部", "领导", "班子", "管理层", "高管", "集团领导"]):
-        required_fields.add("cadre_flag")
-    # organizer / 培训单位相关
-    if any(c in question for c in ["中组部", "调训", "主办单位", "培训机构", "党校"]):
-        required_fields.add("organizer")
-    # department / 部门相关
-    if any(c in question for c in ["部门"]):
-        required_fields.add("department")
-    # unit / 单位相关
-    if any(c in question for c in ["单位"]):
-        required_fields.add("unit")
-    # training_type / 培训类型相关
-    if any(c in question for c in ["培训类型", "培训方式", "学习类型"]):
-        required_fields.add("training_type")
-
-    missing = required_fields - explored_fields
-    if not missing:
-        return ""
-
-    messages = []
-    for field in sorted(missing):
-        table, desc = _EXPLORATION_FIELDS[field]
-        messages.append(
-            f"请先执行: SELECT DISTINCT {field} FROM {table} ORDER BY {field} "
-            f"（查看{desc}的真实值）"
-        )
-    return "; ".join(messages)
 
 
 def _check_final_columns(result_df, is_final: bool) -> str:
@@ -185,6 +110,10 @@ class SQLAgent:
     def __init__(self):
         self._db: Optional[TrainingDatabase] = None
         self._history: list[dict] = []  # {role, content, sql?, result?}
+        self._max_turns: int = MAX_AGENT_TURNS
+        self._turn: int = 1
+        self._messages: list[dict] = []
+        self._question: str = ""
 
     def run_iter(
         self,
@@ -192,6 +121,10 @@ class SQLAgent:
         llm_client,  # LLMClient instance
         db: TrainingDatabase,
         status_writer=None,  # optional st.status() for Streamlit progress
+        resume_messages=None,  # list[dict] — reconstructed messages for recovery
+        start_turn: int = 1,
+        prior_history: list[dict] | None = None,
+        max_turns_override: int | None = None,
     ):
         """Generator-based agent loop with human-in-the-loop support.
 
@@ -201,40 +134,56 @@ class SQLAgent:
             - {"type": "status", "msg": str}
             - {"type": "sql", "sql": str, "rows": int, "exploratory": bool}
             - {"type": "ask", "text": str}   ← human must answer via .send()
+            - {"type": "review", ...}          ← human must feedback via .send()
+            - {"type": "exhausted", ...}       ← human must extend/give_up via .send()
             - {"type": "result", "sql": str, "result": DataFrame,
                "explanation": str, "turns": int, "history": list}
 
         Usage:
             gen = agent.run_iter(...)
-            event = next(gen)                # drive until ask/result
+            event = next(gen)                # drive until ask/review/result
             if event["type"] == "ask":
                 answer = get_human_input()
                 event = gen.send(answer)     # resume with answer
+            elif event["type"] == "review":
+                feedback = get_human_feedback()
+                event = gen.send(feedback)   # resume with feedback dict
         """
         self._db = db
-        self._history = []
+        self._history = list(prior_history) if prior_history else []
+        self._max_turns = max_turns_override if max_turns_override is not None else MAX_AGENT_TURNS
+        self._turn = start_turn - 1
+        self._question = question
 
-        # Step 0: Get schema and build prompt
-        schema_text = self._get_schema()
-        yield {"type": "status", "msg": "🔍 Agent 启动，探索数据库中..."}
+        if resume_messages is None:
+            # Step 0: Get schema and build prompt (fresh start)
+            schema_text = self._get_schema()
+            yield {"type": "status", "msg": "🔍 Agent 启动，探索数据库中..."}
 
-        prompt_builder = PromptBuilder()
-        system_prompt, initial_user = prompt_builder.build_sql_prompt(
-            schema_text=schema_text,
-            question=question,
-        )
+            prompt_builder = PromptBuilder()
+            system_prompt, initial_user = prompt_builder.build_sql_prompt(
+                schema_text=schema_text,
+                question=question,
+            )
 
-        # deepseek-reasoner does not support system role; prepend to first user message
-        messages = [
-            {
-                "role": "user",
-                "content": f"[System Instructions]\n{system_prompt}\n\n{initial_user}",
-            },
-        ]
+            # deepseek-reasoner does not support system role; prepend to first user message
+            messages = [
+                {
+                    "role": "user",
+                    "content": f"[System Instructions]\n{system_prompt}\n\n{initial_user}",
+                },
+            ]
+        else:
+            # Recovery: skip prompt build, use reconstructed messages
+            messages = list(resume_messages)
+            yield {"type": "status", "msg": "🔍 恢复 Agent 会话，继续分析中..."}
 
+        self._messages = messages
         _human_answer = None  # holds answer from .send() when agent asks
 
-        for turn in range(1, MAX_AGENT_TURNS + 1):
+        while self._turn < self._max_turns:
+            self._turn += 1
+            turn = self._turn
             yield {"type": "status", "msg": f"🔄 第 {turn} 轮对话..."}
 
             # Inject human answer if we resumed from an ASK event
@@ -310,13 +259,13 @@ class SQLAgent:
                     }
                     self._history.append({
                         "turn": turn, "sql": sql, "rows": len(result),
-                        "exploratory": not content.strip().upper().startswith("FINAL:"),
+                        "exploratory": "[SQL]" in content and "[FINAL]" not in content,
                     })
                     yield {
                         "type": "sql",
                         "sql": sql,
                         "rows": len(result),
-                        "exploratory": not content.strip().upper().startswith("FINAL:"),
+                        "exploratory": "[SQL]" in content and "[FINAL]" not in content,
                     }
                 except Exception as exc:
                     error_msg = str(exc)
@@ -338,30 +287,7 @@ class SQLAgent:
 
                 # Check if this is the FINAL response
                 content_upper = content.strip().upper()
-                is_final = content_upper.startswith("FINAL:")
-
-                # ---- Mandatory exploration gate ----
-                # If user question contains fuzzy concepts, enforce exploration
-                # before accepting any FINAL SQL.
-                missing_exploration = _check_mandatory_exploration(
-                    question, self._history, sql
-                )
-                if is_final and missing_exploration:
-                    messages.append({"role": "assistant", "content": content})
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            f"⚠️ 强制探索要求：{missing_exploration}\n"
-                            f"用户问题中包含模糊业务概念，"
-                            f"在输出 FINAL SQL 之前，必须先通过 SELECT DISTINCT 查看数据库中的真实值。"
-                            f"请先生成探索性 SQL 查看真实数据，然后再输出 FINAL SQL。"
-                        ),
-                    })
-                    yield {
-                        "type": "status",
-                        "msg": f"🚫 强制探索: {missing_exploration}",
-                    }
-                    continue
+                is_final = "[FINAL]" in content_upper
 
                 # ---- Mandatory result column gate ----
                 # If this is FINAL, enforce detailed column requirements.
@@ -398,37 +324,99 @@ class SQLAgent:
                     }
                     continue
 
-                if is_final or turn == MAX_AGENT_TURNS:
-                    yield {"type": "status", "msg": "✅ Agent 完成，已生成最终 SQL"}
-                    # Get explanation
-                    explanation = self._get_explanation(
-                        llm_client, question, result_summary
-                    )
-                    yield {
-                        "type": "result",
-                        "sql": sql,
-                        "result": result,
-                        "explanation": explanation,
-                        "turns": turn,
-                        "history": self._history,
-                    }
-                    return
+                # ---- Human review gate (Decision 12, 14) ----
+                self._messages = messages
+                feedback = yield {
+                    "type": "review",
+                    "sql": sql,
+                    "result": result,
+                    "result_summary": result_summary,
+                    "turn": turn,
+                    "reasoning": _extract_reasoning(content),
+                    "is_final": is_final,
+                    "exploratory": not is_final,
+                    "remaining_turns": self._max_turns - turn,
+                    "rows": len(result),
+                    "cols": len(result.columns),
+                }
 
-                # Not final — feed result back for further exploration
-                messages.append({"role": "assistant", "content": content})
-                messages.append({
-                    "role": "user",
-                    "content": f"SQL 执行成功。\n{result_summary}\n\n"
-                               f"请继续探索或生成最终 SQL。如果已经获取了足够信息，"
-                               f"请以 'FINAL:' 开头输出最终检索 SQL。",
-                })
+                # Dispatch feedback (Q2=A: keep assistant + append correction)
+                if feedback["action"] == "approve":
+                    if is_final:
+                        # Q4=A: post-approval summary
+                        explanation = self._get_explanation(
+                            llm_client, self._question, result_summary
+                        )
+                        yield {
+                            "type": "result",
+                            "sql": sql,
+                            "reasoning": _extract_reasoning(content),
+                            "result": result,
+                            "explanation": explanation,
+                            "turns": turn,
+                            "history": self._history,
+                        }
+                        return
+                    # Non-final approve: continue exploring
+                    messages.append({"role": "assistant", "content": content})
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            f"SQL 执行成功。\n{result_summary}\n\n"
+                            f"请继续探索或生成最终 SQL。如果已经获取了足够信息，"
+                            f"请以 [FINAL] 标记输出最终检索 SQL。"
+                        ),
+                    })
+                elif feedback["action"] == "reject":
+                    reasoning = _extract_reasoning(content)
+                    messages.append({"role": "assistant", "content": content})
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            f"用户拒绝了你的输出（原因：{feedback['feedback']}）。\n"
+                            f"你的推理：{reasoning}\n"
+                            f"你生成的 SQL：\n{sql}\n"
+                            f"执行结果摘要：{result_summary}\n"
+                            f"请先反思你的推理哪里有偏差，再生成修正后的推理和 SQL。"
+                        ),
+                    })
+                elif feedback["action"] == "append":
+                    reasoning = _extract_reasoning(content)
+                    messages.append({"role": "assistant", "content": content})
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            f"用户追加指令：{feedback['feedback']}\n"
+                            f"你的当前推理：{reasoning}\n"
+                            f"你的当前 SQL：{sql}\n"
+                            f"当前执行结果摘要：{result_summary}\n"
+                            f"请在现有推理基础上结合追加指令，生成新的推理和 SQL。"
+                        ),
+                    })
+                elif feedback["action"] == "extend":
+                    self._max_turns += MAX_AGENT_TURNS_EXTEND
+
+                # Exhaustion check (Decision 18)
+                if turn >= self._max_turns:
+                    if not (feedback["action"] == "approve" and is_final):
+                        exhausted = yield {
+                            "type": "exhausted",
+                            "turn": turn,
+                            "last_action": feedback["action"],
+                        }
+                        if exhausted["action"] == "extend":
+                            self._max_turns += MAX_AGENT_TURNS_EXTEND
+                        else:  # give_up
+                            break
             else:
                 # No SQL in response — LLM is thinking/explaining
                 messages.append({"role": "assistant", "content": content})
                 messages.append({
                     "role": "user",
-                    "content": "请生成一条 SQL 查询（SELECT 或 PRAGMA）。"
-                               "如果已完成探索，请以 'FINAL:' 开头输出最终检索 SQL。",
+                    "content": (
+                        "请生成一条 SQL 查询（SELECT 或 PRAGMA）。"
+                        "如果已完成探索，请以 [FINAL] 标记输出最终检索 SQL。"
+                    ),
                 })
 
         # Max turns reached — return last result if any
@@ -442,18 +430,20 @@ class SQLAgent:
             yield {
                 "type": "result",
                 "sql": last_sql,
+                "reasoning": "达到最大轮次，返回最后一次探索结果",
                 "result": last_result,
                 "explanation": explanation,
-                "turns": MAX_AGENT_TURNS,
+                "turns": self._turn,
                 "history": self._history,
             }
             return
         yield {
             "type": "result",
             "sql": "",
+            "reasoning": "",
             "result": pd.DataFrame({"提示": ["Agent 未能在最大轮次内完成分析"]}),
             "explanation": "分析超时，请尝试更具体的问题。",
-            "turns": MAX_AGENT_TURNS,
+            "turns": self._turn,
             "history": self._history,
         }
 
@@ -489,7 +479,15 @@ class SQLAgent:
                 if event["type"] == "ask":
                     # In blocking mode, auto-reply telling the AI to continue on its own
                     event = gen.send("请继续基于现有信息进行分析，不需要额外人工输入。")
-                elif event["type"] == "result":
+                elif event["type"] == "review":
+                    # Blocking mode: auto-approve every review
+                    event = gen.send({"action": "approve", "feedback": "", "turn": event["turn"]})
+                elif event["type"] == "exhausted":
+                    # Blocking mode: auto-extend to keep going
+                    event = gen.send({"action": "extend"})
+
+                # Catch result whether from next() or from send() above
+                if event["type"] == "result":
                     result = event
                     break
         except StopIteration:
@@ -499,10 +497,19 @@ class SQLAgent:
                 "sql": "",
                 "result": pd.DataFrame({"提示": ["Agent 未能在最大轮次内完成分析"]}),
                 "explanation": "分析超时，请尝试更具体的问题。",
-                "turns": MAX_AGENT_TURNS,
+                "turns": self._max_turns,
                 "history": self._history,
             }
         return result
+
+    def get_state_snapshot(self) -> dict:
+        """Expose current resumable state for persistence."""
+        return {
+            "messages": list(self._messages),
+            "history": list(self._history),
+            "turn": self._turn,
+            "max_turns": self._max_turns,
+        }
 
     def _get_schema(self) -> str:
         """Build a compact database schema for the LLM."""
@@ -632,33 +639,64 @@ class SQLAgent:
                 pass
 
 
-def _extract_sql(text: str) -> str:
-    """Extract SQL from LLM response.
+def _extract_reasoning(text: str) -> str:
+    """Extract reasoning text from [推理] marker.
 
-    Strips 'FINAL:' prefix, markdown code blocks, and trailing semicolons.
+    Returns the text between [推理] and the next action marker ([SQL], [FINAL], [ASK]),
+    or empty string if no [推理] marker found.
+    """
+    text = text.strip()
+    idx = text.find("[推理]")
+    if idx == -1:
+        return ""
+    start = idx + len("[推理]")
+    # Find next action marker
+    end = len(text)
+    for marker in ["[SQL]", "[FINAL]", "[ASK]"]:
+        m = text.find(marker, start)
+        if m != -1 and m < end:
+            end = m
+    reasoning = text[start:end].strip()
+    return reasoning
+
+
+def _extract_sql(text: str) -> str:
+    """Extract SQL from LLM response using [SQL] or [FINAL] markers.
+
+    Falls back to legacy logic (SELECT/PRAGMA search) if no marker found.
     """
     text = text.strip()
 
-    # Remove FINAL: prefix
-    if text.upper().startswith("FINAL:"):
-        text = text[6:].strip()
+    # Find [SQL] or [FINAL] marker
+    start_idx = -1
+    for marker in ["[SQL]", "[FINAL]"]:
+        idx = text.find(marker)
+        if idx != -1:
+            start_idx = idx + len(marker)
+            break
 
-    # Try to extract from markdown code block
-    m = re.search(r"```(?:sql)?\s*\n?(.*?)```", text, re.DOTALL)
-    if m:
-        return m.group(1).strip().rstrip(";")
+    if start_idx != -1:
+        # Extract until next marker or end of text
+        end_idx = len(text)
+        for marker in ["[推理]", "[ASK]", "[SQL]", "[FINAL]"]:
+            m = text.find(marker, start_idx)
+            if m != -1 and m < end_idx:
+                end_idx = m
+        sql_text = text[start_idx:end_idx].strip()
 
-    # If the entire text looks like a SQL statement
-    upper = text.upper()
-    if upper.startswith("SELECT") or upper.startswith("PRAGMA"):
-        # Find the end of the SQL (stop at blank line or explanation text)
-        lines = text.split("\n")
+        # Try to extract from markdown code block inside
+        m = re.search(r"```(?:sql)?\s*\n?(.*?)```", sql_text, re.DOTALL)
+        if m:
+            return m.group(1).strip().rstrip(";")
+
+        # Clean up the SQL text directly
+        lines = sql_text.split("\n")
         sql_lines = []
         for line in lines:
             if not line.strip():
                 break
             stripped = line.strip()
-            # Stop at natural language
+            # Stop at natural language annotations
             if (
                 stripped.startswith("#")
                 or stripped.startswith("--")
@@ -670,16 +708,15 @@ def _extract_sql(text: str) -> str:
             sql_lines.append(stripped)
         return "\n".join(sql_lines).rstrip(";")
 
-    # Last resort: try to find SELECT/PRAGMA in the text
+    # Fallback: legacy logic — try to find SELECT/PRAGMA in the text
+    upper = text.upper()
     for keyword in ["SELECT", "PRAGMA"]:
         idx = upper.find(keyword)
         if idx != -1:
-            # Find semicolon or end of this SQL statement
             remaining = text[idx:]
             semi_idx = remaining.find(";")
             if semi_idx != -1:
                 return remaining[:semi_idx].strip()
-            # Return first non-empty lines
             sql_part = []
             for line in remaining.split("\n"):
                 if not line.strip():
@@ -690,20 +727,27 @@ def _extract_sql(text: str) -> str:
     return text.rstrip(";")
 
 
-
-
 def _extract_ask(text: str) -> str:
-    """Extract human question from LLM response if it starts with ASK:.
+    """Extract human question from LLM response using [ASK] marker.
 
-    Returns the question text, or empty string if no ASK: prefix found.
+    Falls back to legacy prefixes (ASK:, 问：, etc.) if no [ASK] found.
     """
     text = text.strip()
+
+    # New format: [ASK] marker
+    idx = text.find("[ASK]")
+    if idx != -1:
+        start = idx + len("[ASK]")
+        # Extract first non-empty line after marker
+        rest = text[start:].strip()
+        return rest.split("\n")[0].strip()
+
+    # Fallback: legacy prefixes
     upper = text.upper()
-    # Match ASK: at the very beginning, or after a newline
     for prefix in ["ASK:", "问：", "提问:", "QUESTION:", "问题："]:
-        idx = upper.find(prefix)
-        if idx == 0 or (idx > 0 and text[idx - 1] == "\n"):
-            return text[idx + len(prefix):].strip().split("\n")[0].strip()
+        pidx = upper.find(prefix)
+        if pidx == 0 or (pidx > 0 and text[pidx - 1] == "\n"):
+            return text[pidx + len(prefix):].strip().split("\n")[0].strip()
     return ""
 
 
