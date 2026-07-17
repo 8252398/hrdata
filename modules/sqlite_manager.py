@@ -9,6 +9,7 @@ Implements USERNEEDS.md Phase 1 & 2:
 from __future__ import annotations
 
 import sqlite3
+import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -100,19 +101,29 @@ class TrainingDatabase:
     def __init__(self, db_path: Path = DB_PATH):
         self.db_path = Path(db_path)
         self.conn: Optional[sqlite3.Connection] = None
+        self._thread_id: Optional[int] = None
 
     def connect(self) -> sqlite3.Connection:
-        if self.conn is None:
-            self.conn = sqlite3.connect(str(self.db_path))
+        current_tid = threading.current_thread().ident
+        if self.conn is None or self._thread_id != current_tid:
+            if self.conn is not None:
+                try:
+                    self.conn.close()
+                except Exception:
+                    pass
+            self.conn = sqlite3.connect(str(self.db_path), check_same_thread=False)
             self.conn.row_factory = sqlite3.Row
             self.conn.execute("PRAGMA journal_mode=WAL")
             self.conn.execute("PRAGMA foreign_keys=ON")
+            self._thread_id = current_tid
         return self.conn
 
     def close(self) -> None:
         if self.conn:
             self.conn.close()
             self.conn = None
+            self._thread_id = None
+            self._thread_id = None
 
     def reset(self) -> None:
         """Drop and recreate all tables."""
