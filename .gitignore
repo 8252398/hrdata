@@ -9,3 +9,17 @@ __pycache__/
 *.db-wal
 .env
 venv/
+
+# Agent / plugin caches
+.omo/
+.agents/
+.opencode/
+.cache/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
